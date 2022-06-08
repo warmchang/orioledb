@@ -3,6 +3,30 @@ from .base_test import BaseTest
 from testgres.connection import DatabaseError
 
 class VacuumTest(BaseTest):
+	def test_1(self):
+		node = self.node
+		node.start()
+		node.safe_psql("""
+			CREATE EXTENSION IF NOT EXISTS orioledb;
+
+			CREATE TABLE o_test_1(
+				val_1 int,
+				val_2 int
+			)USING orioledb;
+
+			INSERT INTO o_test_1
+				(SELECT val_1, val_1 + 10 FROM generate_series(1, 10) AS val_1);
+		""")
+
+		con1 = node.connect(autocommit=True)
+		con1.execute("VACUUM (FULL) o_test_1;")
+		con1.close()
+
+		node.stop(['-m', 'immediate'])
+
+		node.start()
+		node.stop()
+
 	def test_2(self):
 		node = self.node
 		node.start()
