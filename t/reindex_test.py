@@ -3,6 +3,32 @@ from testgres.connection import ProgrammingError
 from testgres.exceptions import QueryException
 
 class ReindexTest(BaseTest):
+	def test_1(self):
+		node = self.node
+		node.start()
+		node.safe_psql("""
+			CREATE EXTENSION orioledb;
+
+			CREATE TABLE o_test_1(
+				val_1 int,
+				val_2 int
+			)USING orioledb;
+
+			INSERT INTO o_test_1
+				(SELECT val_1, val_1 FROM generate_series(1, 50) AS val_1);
+
+			CREATE INDEX ind_val_1 ON o_test_1(val_2);
+		""")
+
+		con1 = node.connect(autocommit=True)
+		con1.execute("REINDEX TABLE CONCURRENTLY o_test_1;")
+		con1.close()
+
+		node.stop(['-m', 'immediate'])
+
+		node.start()
+		node.stop()
+
 	def test_2(self):
 		node = self.node
 		node.start()
@@ -181,7 +207,7 @@ class ReindexTest(BaseTest):
 			)USING orioledb;
 
 			INSERT INTO o_test_1(val_1, val_2, val_3, val_4, val_5, val_6,
-								 val_7, val_8, val_10, val_11, val_12, val_13)
+								 val_8, val_9, val_10, val_11, val_12, val_13)
 						VALUES(1, 2, 'german', 'namein', '||/'::regoper,
 								'=(integer,integer)', 'pg_stat_scan_tables',
 								'abs(numeric)', 'information_schema',
