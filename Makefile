@@ -85,6 +85,7 @@ REGRESSCHECKS = btree_sys_check \
 				indices_build \
 				ioc \
 				joins \
+				op_class \
 				opclass \
 				partial \
 				primary_key \
