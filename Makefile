@@ -73,12 +73,15 @@ OBJS = src/btree/btree.o \
 	   $(WIN32RES)
 
 REGRESSCHECKS = btree_sys_check \
+				after_trig \
 				bitmap_scan \
 				btree_compression \
 				btree_print \
 				collate \
 				createas \
 				ddl \
+				delete_not_working \
+				domain_test \
 				explain \
 				foreign_keys \
 				indices \
@@ -87,14 +90,21 @@ REGRESSCHECKS = btree_sys_check \
 				joins \
 				op_class \
 				opclass \
+				orioledb_relation_copy_for_cluster \
+				orioledb_scan_sample_next_block \
+				orioledb_tuple_tid_valid \
 				partial \
+				partial_key_index \
 				primary_key \
 				row_level_locks \
+				server_closed \
 				subquery \
 				subtransactions \
 				tableam \
 				toast \
-				types
+				trigger \
+				types \
+				virtual_table_table
 ISOLATIONCHECKS = bitmap_hist_scan \
 				  btree_iterate \
 				  btree_print_backend_id \
