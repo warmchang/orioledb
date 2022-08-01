@@ -74,6 +74,7 @@ OBJS = src/btree/btree.o \
 
 REGRESSCHECKS = btree_sys_check \
 				after_trig \
+				alter_table \
 				bitmap_scan \
 				btree_compression \
 				btree_print \
