@@ -102,7 +102,6 @@ struct BTreeSeqScan
 	BTreeMetaPage *metaPageBlkno;
 	dlist_node	listNode;
 
-	bool		firstNextKey;
 	OFixedKey	nextKey;
 
 	bool		needSampling;
@@ -268,7 +267,6 @@ load_next_internal_page(BTreeSeqScan *scan)
 		scan->hint.blkno = scan->context.items[0].blkno;
 		scan->hint.pageChangeCount = scan->context.items[0].pageChangeCount;
 		BTREE_PAGE_LOCATOR_SET_INVALID(&scan->intLoc);
-		scan->firstNextKey = true;
 		O_TUPLE_SET_NULL(scan->nextKey.tuple);
 		load_first_historical_page(scan);
 		has_next = false;
@@ -551,7 +549,6 @@ iterate_internal_page(BTreeSeqScan *scan)
 					scan->hint.pageChangeCount = DOWNLINK_GET_IN_MEMORY_CHANGECOUNT(downlink);
 					BTREE_PAGE_LOCATOR_FIRST(scan->leafImg, &scan->leafLoc);
 					BTREE_PAGE_LOCATOR_NEXT(scan->context.img, &scan->intLoc);
-					scan->firstNextKey = true;
 					O_TUPLE_SET_NULL(scan->nextKey.tuple);
 					load_first_historical_page(scan);
 					return true;
@@ -638,7 +635,6 @@ load_next_disk_leaf_page(BTreeSeqScan *scan)
 	scan->downlinkIndex++;
 	scan->hint.blkno = OInvalidInMemoryBlkno;
 	scan->hint.pageChangeCount = InvalidOPageChangeCount;
-	scan->firstNextKey = true;
 	O_TUPLE_SET_NULL(scan->nextKey.tuple);
 	load_first_historical_page(scan);
 	return true;
@@ -667,7 +663,6 @@ make_btree_seq_scan_internal(BTreeDescr *desc, CommitSeqNo csn,
 	scan->iter = NULL;
 	scan->cb = cb;
 	scan->arg = arg;
-	scan->firstNextKey = true;
 
 	scan->samplingNumber = 0;
 	scan->sampler = sampler;
