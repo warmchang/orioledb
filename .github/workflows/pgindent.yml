@@ -22,6 +22,9 @@ jobs:
         uses: actions/checkout@v3
         with:
           path: orioledb
+      - name: nproc
+        shell: bash
+        run: nproc
       - name: Get the required tag name
         shell: bash
         run: |
