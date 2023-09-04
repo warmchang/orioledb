@@ -1067,8 +1067,9 @@ o_perform_checkpoint(XLogRecPtr redo_pos, int flags)
 	elog(LOG, "orioledb checkpoint %u complete",
 		 checkpoint_state->lastCheckpointNumber);
 
-	if (!(flags & CHECKPOINT_END_OF_RECOVERY) && orioledb_s3_mode)
-		s3_perform_backup(maxLocation);
+	// TODO: Remove CHECKPOINT_IS_SHUTDOWN check when normal load implemented
+	if (!(flags & (CHECKPOINT_IS_SHUTDOWN)) && orioledb_s3_mode)
+		s3_perform_backup();
 
 	if (next_CheckPoint_hook)
 		next_CheckPoint_hook(redo_pos, flags);

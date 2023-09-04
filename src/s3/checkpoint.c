@@ -202,35 +202,26 @@ static void
 fill_backup_state(BackupState *state)
 {
 	char	   *label = "base backup";
+	ControlFileData *ControlFile;
+	bool		crc_ok;
 
 	Assert(state != NULL);
 	memcpy(state->name, label, strlen(label));
 
-	/*
-	 * Ensure we decrement runningBackups if we fail below. NB -- for this to
-	 * work correctly, it is critical that sessionBackupState is only updated
-	 * after this block is over.
-	 */
-	PG_ENSURE_ERROR_CLEANUP(do_pg_abort_backup, DatumGetBool(true));
-	{
-		ControlFileData *ControlFile;
-		bool		crc_ok;
-
+	if (!backup_started_in_recovery)
 		RequestXLogSwitch(false);
 
-		LWLockAcquire(ControlFileLock, LW_SHARED);
-		ControlFile = get_controlfile(DataDir, &crc_ok);
-		if (!crc_ok)
-			ereport(ERROR,
-					(errmsg("calculated CRC checksum does not match value stored in file")));
-		state->checkpointloc = ControlFile->checkPoint;
-		state->startpoint = ControlFile->checkPointCopy.redo;
-		state->starttli = ControlFile->checkPointCopy.ThisTimeLineID;
-		LWLockRelease(ControlFileLock);
+	LWLockAcquire(ControlFileLock, LW_SHARED);
+	ControlFile = get_controlfile(DataDir, &crc_ok);
+	if (!crc_ok)
+		ereport(ERROR,
+				(errmsg("calculated CRC checksum does not match value stored in file")));
+	state->checkpointloc = ControlFile->checkPoint;
+	state->startpoint = ControlFile->checkPointCopy.redo;
+	state->starttli = ControlFile->checkPointCopy.ThisTimeLineID;
+	LWLockRelease(ControlFileLock);
 
-		state->starttime = (pg_time_t) time(NULL);
-	}
-	PG_END_ENSURE_ERROR_CLEANUP(do_pg_abort_backup, DatumGetBool(true));
+	state->starttime = (pg_time_t) time(NULL);
 
 	state->started_in_recovery = false;
 }
@@ -242,7 +233,7 @@ fill_backup_state(BackupState *state)
  * clobbered by longjmp" from stupider versions of gcc.
  */
 void
-s3_perform_backup(S3TaskLocation location)
+s3_perform_backup()
 {
 	uint32		chkpNum = checkpoint_state->lastCheckpointNumber;
 	S3BackupState state;
@@ -250,6 +241,7 @@ s3_perform_backup(S3TaskLocation location)
 	ListCell   *lc;
 	tablespaceinfo *newti;
 	BackupState *backup_state;
+	bool		backup_stopped_in_recovery = false;
 
 	backup_started_in_recovery = RecoveryInProgress();
 
@@ -320,20 +312,27 @@ s3_perform_backup(S3TaskLocation location)
 							   state.tablespaces, ti->oid);
 		}
 	}
-	/*
-	 * Write the backup-end xlog record
-	 */
-	XLogBeginInsert();
-	XLogRegisterData((char *) (&backup_state->startpoint),
-					 sizeof(backup_state->startpoint));
-	XLogInsert(RM_XLOG_ID, XLOG_BACKUP_END);
 
-	/*
-	 * Force a switch to a new xlog segment file, so that the backup is
-	 * valid as soon as archiver moves out the current segment file.
-	 */
-	RequestXLogSwitch(false);
+	backup_stopped_in_recovery = RecoveryInProgress();
 
+	if (!backup_stopped_in_recovery)
+	{
+		/*
+		* Write the backup-end xlog record
+		*/
+		XLogBeginInsert();
+		XLogRegisterData((char *) (&backup_state->startpoint),
+						sizeof(backup_state->startpoint));
+		XLogInsert(RM_XLOG_ID, XLOG_BACKUP_END);
+
+		/*
+		* Force a switch to a new xlog segment file, so that the backup is
+		* valid as soon as archiver moves out the current segment file.
+		*/
+		RequestXLogSwitch(false);
+	}
+
+	// TODO: waitforarchive
 	pfree(tablespaceMapData.data);
 	pfree(backup_state);
 	s3_queue_wait_for_location(maxLocation);
