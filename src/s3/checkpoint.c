@@ -292,14 +292,20 @@ s3_perform_backup()
 
 			FileClose(backup_file);
 
-			location = s3_schedule_file_write(chkpNum, backup_filename);
+			location = s3_schedule_file_write(chkpNum, backup_filename,
+											  S3WriteFileBackupLabel);
 			maxLocation = Max(maxLocation, location);
 			pfree(backup_label);
 
 			/* Then the bulk of the files... */
 			s3_backup_scan_dir(chkpNum, ".", 1, state.tablespaces, NULL);
 
-			location = s3_schedule_file_write(chkpNum, XLOG_CONTROL_FILE);
+			location = s3_schedule_file_write(chkpNum, XLOG_CONTROL_FILE,
+											  S3WriteFilePostgres);
+			maxLocation = Max(maxLocation, location);
+
+			location = s3_schedule_file_write(chkpNum, ORIOLEDB_DATA_DIR"/control",
+											  S3WriteFileOrioledb);
 			maxLocation = Max(maxLocation, location);
 		}
 		else
@@ -604,7 +610,8 @@ s3_backup_scan_dir(uint32 chkpNum, const char *path, int basepathlen,
 		{
 			S3TaskLocation location;
 
-			location = s3_schedule_file_write(chkpNum, pathbuf);
+			location = s3_schedule_file_write(chkpNum, pathbuf,
+											  S3WriteFilePostgres);
 			maxLocation = Max(maxLocation, location);
 		}
 		else

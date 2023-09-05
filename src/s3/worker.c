@@ -97,28 +97,42 @@ s3process_task(uint64 taskLocation)
 	if (task->type == S3TaskTypeWriteFile)
 	{
 		char	   *filename = task->typeSpecific.writeFile.filename;
-		bool		backup;
-
-		backup = strcmp(filename,
-						ORIOLEDB_DATA_DIR "/" BACKUP_LABEL_FILE) == 0;
+		S3WriteFileType file_type =  task->typeSpecific.writeFile.file_type;
 
 		if (filename[0] == '.' && filename[1] == '/')
 			filename += 2;
 
-		if (backup)
+		switch (file_type)
+		{
+		case S3WriteFileBackupLabel:
 			objectname = psprintf("data/%u/%s",
 								  task->typeSpecific.writeFile.chkpNum,
 								  BACKUP_LABEL_FILE);
-		else
+			break;
+		case S3WriteFilePostgres:
 			objectname = psprintf("data/%u/%s",
 								  task->typeSpecific.writeFile.chkpNum,
 								  filename);
+			break;
+		case S3WriteFileOrioledb:
+			{
+				char	   *new_filename = filename;
+				new_filename += sizeof(ORIOLEDB_DATA_DIR);
+				objectname = psprintf("orioledb_data/%u/%s",
+									  task->typeSpecific.writeFile.chkpNum,
+									  new_filename);
+			}
+			break;
+		default:
+			Assert(false);
+			break;
+		}
 
-		elog(DEBUG1, "S3 put %s %s", objectname, filename);
+		elog(WARNING, "S3 put %s %s", objectname, filename);
 
 		s3_put_file(objectname, filename);
 
-		if (backup)
+		if (file_type == S3WriteFileBackupLabel)
 			unlink(filename);
 		pfree(objectname);
 	}
@@ -133,7 +147,7 @@ s3process_task(uint64 taskLocation)
 							  task->typeSpecific.writeFile.chkpNum,
 							  dirname);
 
-		elog(DEBUG1, "S3 dir put %s %s", objectname, dirname);
+		elog(WARNING, "S3 dir put %s %s", objectname, dirname);
 
 		s3_put_empty_dir(objectname);
 		pfree(objectname);
@@ -155,7 +169,7 @@ s3process_task(uint64 taskLocation)
 							  task->typeSpecific.writeFilePart.segNum,
 							  task->typeSpecific.writeFilePart.partNum);
 
-		elog(DEBUG1, "S3 part put %s %s", objectname, filename);
+		elog(WARNING, "S3 part put %s %s", objectname, filename);
 
 		s3_put_file_part(objectname, filename, task->typeSpecific.writeFilePart.partNum);
 
@@ -181,7 +195,7 @@ s3process_task(uint64 taskLocation)
 							  task->typeSpecific.writeFilePart.datoid,
 							  task->typeSpecific.writeFilePart.relnode);
 
-		elog(DEBUG1, "S3 map put %s %s", objectname, filename);
+		elog(WARNING, "S3 map put %s %s", objectname, filename);
 
 		s3_put_file(objectname, filename);
 
@@ -198,7 +212,8 @@ s3process_task(uint64 taskLocation)
  * Schedule a synchronization of given data file to S3.
  */
 S3TaskLocation
-s3_schedule_file_write(uint32 chkpNum, char *filename)
+s3_schedule_file_write(uint32 chkpNum, char *filename,
+					   S3WriteFileType file_type)
 {
 	S3Task	   *task;
 	int			filenameLen,
@@ -210,6 +225,7 @@ s3_schedule_file_write(uint32 chkpNum, char *filename)
 	task = (S3Task *) palloc0(taskLen);
 	task->type = S3TaskTypeWriteFile;
 	task->typeSpecific.writeFile.chkpNum = chkpNum;
+	task->typeSpecific.writeFile.file_type = file_type;
 	memcpy(task->typeSpecific.writeFile.filename, filename, filenameLen + 1);
 
 	location = s3_queue_put_task((Pointer) task, taskLen);

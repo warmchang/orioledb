@@ -1,0 +1,78 @@
+/usr/local/bin/gmkdir -p '/Users/homper/pg16/lib/postgresql'
+/usr/local/bin/gmkdir -p '/Users/homper/pg16/share/postgresql/extension'
+/usr/local/bin/gmkdir -p '/Users/homper/pg16/share/postgresql/extension'
+/usr/local/bin/ginstall -c -m 755  orioledb.dylib '/Users/homper/pg16/lib/postgresql/orioledb.dylib'
+/usr/local/bin/ginstall -c -m 644 .//orioledb.control '/Users/homper/pg16/share/postgresql/extension/'
+/usr/local/bin/ginstall -c -m 644 .//orioledb--1.0.sql  '/Users/homper/pg16/share/postgresql/extension/'
+PATH="/tmp_install/Users/homper/pg16/bin:/Users/homper/projects/orioledb:$PATH" DYLD_LIBRARY_PATH="/tmp_install/Users/homper/pg16/lib"  PGCTLTIMEOUT=900 \
+	python3 -W ignore::DeprecationWarning -m unittest -v t.s3_test.S3Test.test_s3_new_node
+test_s3_new_node (t.s3_test.S3Test) ... orioledb_data/5/1/11.map orioledb_data/1/11-5.map
+orioledb_data/5/1/12.map orioledb_data/1/12-5.map
+orioledb_data/5/1/13.map orioledb_data/1/13-5.map
+orioledb_data/5/1/14.map orioledb_data/1/14-5.map
+orioledb_data/5/1/15.map orioledb_data/1/15-5.map
+orioledb_data/5/1/16.map orioledb_data/1/16-5.map
+orioledb_data/5/1/17.map orioledb_data/1/17-5.map
+orioledb_data/5/1/18.map orioledb_data/1/18-5.map
+orioledb_data/5/1/19.map orioledb_data/1/19-5.map
+orioledb_data/5/1/2.map orioledb_data/1/2-5.map
+orioledb_data/5/1/3.map orioledb_data/1/3-5.map
+orioledb_data/5/1/4.map orioledb_data/1/4-5.map
+orioledb_data/5/1/5.map orioledb_data/1/5-5.map
+orioledb_data/5/1/6.map orioledb_data/1/6-5.map
+orioledb_data/5/1/7.map orioledb_data/1/7-5.map
+orioledb_data/5/1/8.map orioledb_data/1/8-5.map
+orioledb_data/5/5/16441.0.0 orioledb_data/5/16441-5
+orioledb_data/5/5/16441.map orioledb_data/5/16441-5.map
+orioledb_data/5/5/16444.map orioledb_data/5/16444-5.map
+ERROR
+ERROR
+
+======================================================================
+ERROR: test_s3_new_node (t.s3_test.S3Test)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/homper/projects/orioledb/t/s3_test.py", line 415, in test_s3_new_node
+    new_node.execute("SELECT * FROM o_test_1"))
+  File "/Users/homper/.pyenv/versions/3.9.16/lib/python3.9/site-packages/testgres/decorators.py", line 60, in _wrapper
+    return bound_func(*args, **kwargs)
+  File "/Users/homper/.pyenv/versions/3.9.16/lib/python3.9/site-packages/testgres/decorators.py", line 42, in wrapper
+    return function(*args, **kwargs)
+  File "/Users/homper/.pyenv/versions/3.9.16/lib/python3.9/site-packages/testgres/decorators.py", line 57, in bound_func
+    return func.__get__(self, type(self))(*args2, **kwargs2)
+  File "/Users/homper/.pyenv/versions/3.9.16/lib/python3.9/site-packages/testgres/node.py", line 1100, in execute
+    res = node_con.execute(query)
+  File "/Users/homper/.pyenv/versions/3.9.16/lib/python3.9/site-packages/testgres/connection.py", line 107, in execute
+    self.cursor.execute(query, args)
+psycopg2.OperationalError: server closed the connection unexpectedly
+	This probably means the server terminated abnormally
+	before or while processing the request.
+
+
+======================================================================
+ERROR: test_s3_new_node (t.s3_test.S3Test)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/homper/projects/orioledb/t/s3_test.py", line 89, in tearDown
+    super().tearDown()
+  File "/Users/homper/projects/orioledb/t/base_test.py", line 94, in tearDown
+    self.replica.stop()  # just comment it if node should not stops on fails
+  File "/Users/homper/.pyenv/versions/3.9.16/lib/python3.9/site-packages/testgres/node.py", line 682, in stop
+    execute_utility(_params, self.utils_log_file)
+  File "/Users/homper/.pyenv/versions/3.9.16/lib/python3.9/site-packages/testgres/utils.py", line 112, in execute_utility
+    raise ExecUtilException(message=message,
+testgres.exceptions.ExecUtilException: Utility exited with non-zero code
+Command: /Users/homper/pg16/bin/pg_ctl -D /var/folders/0h/3_5s80g56dx40pf7ydyjgs780000gn/T/s3_tgsb_enbx1iwe/data -w stop
+Exit code: 1
+----
+waiting for server to shut down............. failed
+pg_ctl: server does not shut down
+
+
+----------------------------------------------------------------------
+Ran 1 test in 50.331s
+
+FAILED (errors=2)
+
+Base directory: /var/folders/0h/3_5s80g56dx40pf7ydyjgs780000gn/T/s3_tgsn_j5h0mjz4
+make: *** [t.s3_test.S3Test.test_s3_new_node] Error 1

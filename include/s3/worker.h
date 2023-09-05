@@ -22,6 +22,13 @@ typedef enum
 	S3TaskTypeWriteEmptyDir
 } S3TaskType;
 
+typedef enum
+{
+	S3WriteFilePostgres,
+	S3WriteFileBackupLabel,
+	S3WriteFileOrioledb,
+} S3WriteFileType;
+
 /*
  * The data structure representing the task for S3 worker.
  */
@@ -33,6 +40,7 @@ typedef struct
 		struct
 		{
 			uint32		chkpNum;
+			S3WriteFileType file_type;
 			char		filename[FLEXIBLE_ARRAY_MEMBER];
 		}			writeFile;
 		struct
@@ -55,7 +63,8 @@ extern Size s3_workers_shmem_needs(void);
 extern void s3_workers_init_shmem(Pointer ptr, bool found);
 extern void register_s3worker(int num);
 PGDLLEXPORT void s3worker_main(Datum);
-extern S3TaskLocation s3_schedule_file_write(uint32 chkpNum, char *filename);
+extern S3TaskLocation s3_schedule_file_write(uint32 chkpNum, char *filename,
+											 S3WriteFileType file_type);
 extern S3TaskLocation s3_schedule_empty_dir_write(uint32 chkpNum,
 												  char *dirname);
 extern S3TaskLocation s3_schedule_file_part_write(uint32 chkpNum, Oid datoid,

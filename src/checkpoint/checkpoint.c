@@ -4510,6 +4510,9 @@ evictable_tree_init_meta(BTreeDescr *desc, EvictedTreeData **evicted_data,
 		prev_chkp_fname = get_seq_buf_filename(&prev_chkp_tag);
 		prev_chkp_file = PathNameOpenFile(prev_chkp_fname, O_RDONLY | PG_BINARY);
 		prev_chkp_file_exist = prev_chkp_file >= 0;
+		elog(WARNING, "evictable_tree_init_meta: %u %u %u %d: %u; prev_chkp_file_exist: %c",
+			desc->oids.datoid, desc->oids.reloid, desc->oids.relnode, desc->type,
+			chkp_num, prev_chkp_file_exist ? 'Y' : 'N');
 
 		if (!prev_chkp_file_exist)
 		{
@@ -4717,6 +4720,9 @@ checkpointable_tree_init(BTreeDescr *desc, bool init_shmem, bool *was_evicted)
 
 	chkp_num = get_cur_checkpoint_number(&desc->oids, desc->type,
 										 &checkpoint_concurrent);
+	elog(WARNING, "checkpointable_tree_init: %u %u %u %d: %u; init_shmem: %c",
+		 desc->oids.datoid, desc->oids.reloid, desc->oids.relnode, desc->type,
+		 chkp_num, init_shmem ? 'Y' : 'N');
 
 	/*
 	 * We shouldn't initialize shared memory concurrently to checkpoint.
