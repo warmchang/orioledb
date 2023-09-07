@@ -4,10 +4,11 @@ import os
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
 from os import path
 from tempfile import mkdtemp
 from threading import Event, Thread
-from typing import Callable, Optional
+from typing import Callable, Optional, Union
 
 import boto3
 import testgres
@@ -15,12 +16,15 @@ from boto3.s3.transfer import TransferConfig
 from botocore import UNSIGNED
 from botocore.config import Config
 from botocore.exceptions import ClientError
+from cryptography.hazmat.primitives.asymmetric.rsa import \
+    RSAPrivateKeyWithSerialization
+from cryptography.x509 import Certificate
 from moto.core import set_initial_no_auth_action_count
 from moto.server import DomainDispatcherApplication, create_backend_app
 from testgres.consts import DATA_DIR
 from testgres.defaults import default_dbname, default_username
 from testgres.utils import clean_on_error
-from werkzeug.serving import BaseWSGIServer, make_server, make_ssl_devcert
+from werkzeug.serving import BaseWSGIServer, make_server
 
 from .base_test import BaseTest
 
@@ -29,7 +33,7 @@ log.setLevel(logging.ERROR)
 
 class S3Test(BaseTest):
 	bucket_name = "test-bucket"
-	host="localhost"
+	host="127.0.0.1"
 	port=5000
 	iam_port=5001
 	dir_path = path.dirname(path.realpath(__file__))
@@ -552,8 +556,98 @@ class OrioledbS3ObjectLoader:
 							  transform=self.transform_orioledb)
 
 
+def generate_adhoc_ssl_pair(
+	cn: Union[str, None] = None,
+) -> tuple[Certificate, RSAPrivateKeyWithSerialization]:
+	try:
+		from cryptography import x509
+		from cryptography.hazmat.backends import default_backend
+		from cryptography.hazmat.primitives import hashes
+		from cryptography.hazmat.primitives.asymmetric import rsa
+		from cryptography.x509.oid import NameOID
+	except ImportError:
+		raise TypeError(
+			"Using ad-hoc certificates requires the cryptography library."
+		) from None
+
+	backend = default_backend()
+	pkey = rsa.generate_private_key(
+		public_exponent=65537, key_size=2048, backend=backend
+	)
+
+	# pretty damn sure that this is not actually accepted by anyone
+	if cn is None:
+		cn = "*"
+
+	subject = x509.Name(
+		[
+			x509.NameAttribute(NameOID.ORGANIZATION_NAME, "Dummy Certificate"),
+			x509.NameAttribute(NameOID.COMMON_NAME, cn),
+		]
+	)
+
+	backend = default_backend()
+	cert = (
+		x509.CertificateBuilder()
+		.subject_name(subject)
+		.issuer_name(subject)
+		.public_key(pkey.public_key())
+		.serial_number(x509.random_serial_number())
+		.not_valid_before(datetime.now(timezone.utc))
+		.not_valid_after(datetime.now(timezone.utc) + timedelta(days=365))
+		.add_extension(x509.ExtendedKeyUsage([x509.OID_SERVER_AUTH]), critical=False)
+		.add_extension(x509.SubjectAlternativeName([x509.UniformResourceIdentifier(cn)]), critical=False)
+		.sign(pkey, hashes.SHA256(), backend)
+	)
+	return cert, pkey
+
+
+def make_ssl_devcert(
+	base_path: str, host: Union[str, None] = None, cn: Union[str, None] = None
+) -> tuple[str, str]:
+	"""Creates an SSL key for development.  This should be used instead of
+	the ``'adhoc'`` key which generates a new cert on each server start.
+	It accepts a path for where it should store the key and cert and
+	either a host or CN.  If a host is given it will use the CN
+	``*.host/CN=host``.
+
+	For more information see :func:`run_simple`.
+
+	.. versionadded:: 0.9
+
+	:param base_path: the path to the certificate and key.  The extension
+					``.crt`` is added for the certificate, ``.key`` is
+					added for the key.
+	:param host: the name of the host.  This can be used as an alternative
+				for the `cn`.
+	:param cn: the `CN` to use.
+	"""
+
+	if host is not None:
+		cn = f"*.{host}/CN={host}"
+	cert, pkey = generate_adhoc_ssl_pair(cn=cn)
+
+	from cryptography.hazmat.primitives import serialization
+
+	cert_file = f"{base_path}.crt"
+	pkey_file = f"{base_path}.key"
+
+	with open(cert_file, "wb") as f:
+		f.write(cert.public_bytes(serialization.Encoding.PEM))
+	with open(pkey_file, "wb") as f:
+		f.write(
+			pkey.private_bytes(
+				encoding=serialization.Encoding.PEM,
+				format=serialization.PrivateFormat.TraditionalOpenSSL,
+				encryption_algorithm=serialization.NoEncryption(),
+			)
+		)
+
+	return cert_file, pkey_file
+
+
 class MotoServerSSL:
-	def __init__(self, host: str = "localhost", port: int = 5000,
+	def __init__(self, host: str = "127.0.0.1", port: int = 5000,
 				 service: Optional[str] = None, ssl_context=None):
 		self._host = host
 		self._port = port
