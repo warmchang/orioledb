@@ -24,7 +24,7 @@ if [ $CHECK_TYPE = "valgrind_1" ]; then
 elif [ $CHECK_TYPE = "valgrind_2" ]; then
 	make USE_PGXS=1 VALGRIND=1 testgrescheck_part_2 -j$THREADS || status=$?
 else
-	make USE_PGXS=1 installcheck -j$THREADS || status=$?
+	make USE_PGXS=1 installcheck || status=$?
 fi
 cd ..
 

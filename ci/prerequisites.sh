@@ -16,7 +16,7 @@ apt_packages="build-essential flex bison pkg-config libreadline-dev make gdb lib
 if [ $GITHUB_JOB = "run-benchmark" ]; then
 	pip_packages="psycopg2-binary six testgres python-telegram-bot matplotlib"
 else
-	pip_packages="psycopg2 six testgres"
+	pip_packages="six testgres"
 fi
 
 if [ $COMPILER = "clang" ]; then
@@ -33,4 +33,5 @@ fi
 
 # install required packages
 sudo apt-get -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" -y install -qq $apt_packages
+pg_config
 sudo env "PATH=$PATH" pip3 install --upgrade $pip_packages

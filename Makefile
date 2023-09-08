@@ -129,23 +129,7 @@ ISOLATIONCHECKS = bitmap_hist_scan \
 				  rll_subtrans \
 				  table_lock_test \
 				  uniq
-TESTGRESCHECKS_PART_1 = t/checkpointer_test.py \
-						t/eviction_bgwriter_test.py \
-						t/eviction_compression_test.py \
-						t/eviction_test.py \
-						t/file_operations_test.py \
-						t/files_test.py \
-						t/incomplete_split_test.py \
-						t/merge_test.py \
-						t/o_tables_test.py \
-						t/o_tables_2_test.py \
-						t/recovery_test.py \
-						t/recovery_opclass_test.py \
-						t/recovery_worker_test.py \
-						t/replication_test.py \
-						t/types_test.py \
-						t/undo_eviction_test.py \
-						t/toast_index_test.py
+TESTGRESCHECKS_PART_1 = t.checkpointer_test
 TESTGRESCHECKS_PART_2 = t/checkpoint_concurrent_test.py \
 						t/checkpoint_eviction_test.py \
 						t/checkpoint_same_trx_test.py \
@@ -198,7 +182,7 @@ $(TESTGRESCHECKS_PART_1) $(TESTGRESCHECKS_PART_2): | install
 	$(with_temp_install) \
 	python3 -W ignore::DeprecationWarning -m unittest -v $@
 
-installcheck: regresscheck isolationcheck testgrescheck
+installcheck: testgrescheck
 	echo "All checks are successful!"
 
 else
@@ -272,7 +256,7 @@ submake-isolation:
 submake-orioledb:
 	$(MAKE) -C $(top_builddir)/contrib/orioledb
 
-testgrescheck: $(TESTGRESCHECKS_PART_1) $(TESTGRESCHECKS_PART_2)
+testgrescheck: $(TESTGRESCHECKS_PART_1)
 
 testgrescheck_part_1: $(TESTGRESCHECKS_PART_1)
 

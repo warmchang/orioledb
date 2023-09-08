@@ -16,7 +16,7 @@ fi
 
 # show diff if it exists
 for f in ` find . -name regression.diffs ` ; do
-	echo "========= Contents of $f" 
+	echo "========= Contents of $f"
 	cat $f
 	status=1
 done
