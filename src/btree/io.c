@@ -12,6 +12,7 @@
  */
 #include "postgres.h"
 
+#include <sys/fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #include <sys/mman.h>
@@ -32,6 +33,7 @@
 #include "tableam/descr.h"
 #include "tableam/handler.h"
 #include "utils/compress.h"
+#include "utils/elog.h"
 #include "utils/page_pool.h"
 #include "utils/seq_buf.h"
 #include "utils/stopevent.h"
@@ -284,7 +286,7 @@ btree_open_smgr_file(BTreeDescr *desc, uint32 num, uint32 chkpNum,
 		if (hashElem->file <= 0)
 			ereport(FATAL,
 					(errcode_for_file_access(),
-					 errmsg("could not open data file %s", filename)));
+					 errmsg("could not open data file %s: %m", filename)));
 		pfree(filename);
 		return hashElem->file;
 	}
@@ -315,7 +317,7 @@ btree_open_smgr_file(BTreeDescr *desc, uint32 num, uint32 chkpNum,
 		if (desc->smgr.array.files[num] <= 0)
 			ereport(FATAL,
 					(errcode_for_file_access(),
-					 errmsg("could not open data file %s", filename)));
+					 errmsg("could not open data file %s: %m", filename)));
 		pfree(filename);
 		return desc->smgr.array.files[num];
 	}
@@ -780,6 +782,64 @@ btree_smgr_sync(BTreeDescr *desc, uint32 chkpNum, off_t length)
 }
 
 void
+btree_smgr_punch_hole(BTreeDescr *desc, uint32 chkpNum,
+					  off_t offset, int length)
+{
+	Assert(!orioledb_s3_mode && !use_mmap && !use_device);
+
+	while (length > 0)
+	{
+		File		file;
+		int			fd;
+		int			segno = offset / ORIOLEDB_SEGMENT_SIZE;
+		off_t		segoffset;
+		int			seglength;
+		int			ret;
+
+		file = btree_open_smgr_file(desc, segno, chkpNum, 0);
+		fd = FileGetRawDesc(file);
+
+		segoffset = offset % ORIOLEDB_SEGMENT_SIZE;
+		if ((offset + length) / ORIOLEDB_SEGMENT_SIZE == segno)
+		{
+			seglength = length;
+			length = 0;
+		}
+		else
+		{
+			seglength = ORIOLEDB_SEGMENT_SIZE - segoffset;
+			Assert(length >= seglength);
+
+			offset += seglength;
+			length -= seglength;
+		}
+#ifdef __APPLE__
+		{
+			fpunchhole_t hole;
+
+			memset(&hole, 0, sizeof(hole));
+			hole.fp_offset = segoffset;
+			hole.fp_length = seglength;
+			ret = fcntl(fd, F_PUNCHHOLE, &hole);
+		}
+#else
+		ret = fallocate(fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE,
+						segoffset, seglength);
+#endif
+		if (ret < 0)
+		{
+			int			save_errno = errno;
+
+			ereport(WARNING,
+					(errcode_for_file_access(),
+					 errmsg("fail to punch sparse file hole datoid=%u relnode=%u offset=%llu length=%d (%d %s)",
+							desc->oids.datoid, desc->oids.relnode,
+							(unsigned long long) offset, length, save_errno, strerror(save_errno))));
+		}
+	}
+}
+
+void
 btree_io_error_cleanup(void)
 {
 	if (io_in_progress)
@@ -875,6 +935,12 @@ get_free_disk_offset(BTreeDescr *desc)
 					old_tag = desc->freeBuf.shared->tag;
 		SeqBufReplaceResult replaceResult;
 
+		if (orioledb_use_sparse_files)
+		{
+			try_to_punch_holes(desc);
+			Assert(free_buf_num + 1 <= metaPage->punchHolesChkpNum);
+		}
+
 		tag.datoid = desc->oids.datoid;
 		tag.relnode = desc->oids.relnode;
 		tag.num = free_buf_num + 1;
@@ -900,7 +966,9 @@ get_free_disk_offset(BTreeDescr *desc)
 			else
 			{
 				Assert(old_tag.type == 't');
-				seq_buf_remove_file(&old_tag);
+				if (!orioledb_use_sparse_files ||
+					old_tag.num <= metaPage->punchHolesChkpNum)
+					seq_buf_remove_file(&old_tag);
 			}
 		}
 		LWLockRelease(metaLock);
@@ -1279,6 +1347,8 @@ load_page(OBTreeFindPageContext *context)
 	uint32		parent_change_count;
 	BTreeNonLeafTuphdr *int_hdr;
 	OInMemoryBlkno blkno;
+	OFixedKey	target_hikey;
+	int			target_level;
 	Page		page;
 	char		buf[ORIOLEDB_BLCKSZ];
 	bool		was_modify;
@@ -1306,6 +1376,16 @@ load_page(OBTreeFindPageContext *context)
 	int_hdr->downlink = MAKE_IO_DOWNLINK(ionum);
 	Assert(PAGE_GET_N_ONDISK(parent_page) > 0);
 	PAGE_DEC_N_ONDISK(parent_page);
+
+	BTREE_PAGE_LOCATOR_NEXT(parent_page, parent_loc);
+	if (BTREE_PAGE_LOCATOR_IS_VALID(parent_page, parent_loc))
+		copy_fixed_page_key(desc, &target_hikey, parent_page, parent_loc);
+	else if (!O_PAGE_IS(parent_page, RIGHTMOST))
+		copy_fixed_hikey(desc, &target_hikey, parent_page);
+	else
+		clear_fixed_key(&target_hikey);
+	target_level = PAGE_GET_LEVEL(parent_page) - 1;
+
 	unlock_page(parent_blkno);
 
 	/* Prepare new page metaPage-data */
@@ -1332,7 +1412,7 @@ load_page(OBTreeFindPageContext *context)
 
 		ereport(ERROR, (errcode_for_file_access(),
 		/* cppcheck-suppress unknownMacro */
-						errmsg("could not read page with file offset " UINT64_FORMAT " from %s",
+						errmsg("could not read page with file offset " UINT64_FORMAT " from %s: %m",
 							   DOWNLINK_GET_DISK_OFF(downlink),
 							   btree_smgr_filename(desc, DOWNLINK_GET_DISK_OFF(downlink), chkpNum))));
 	}
@@ -1394,9 +1474,22 @@ load_page(OBTreeFindPageContext *context)
 	if (!was_downlink_location)
 		BTREE_PAGE_FIND_SET(context, DOWNLINK_LOCATION);
 	context->csn = COMMITSEQNO_INPROGRESS;
+	if (PAGE_GET_LEVEL(page) != target_level)
+		ereport(PANIC, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						errmsg("error reading downlink %X/%X in relfile (%u, %u)",
+							   (uint32) (downlink >> 32), (uint32) (downlink),
+							   desc->oids.datoid, desc->oids.relnode),
+						errdetail("Level mismatch, expected: %d, found: %d",
+								  PAGE_GET_LEVEL(page), target_level)));
 
 	if (O_PAGE_IS(page, RIGHTMOST))
 	{
+		if (!O_TUPLE_IS_NULL(target_hikey.tuple))
+			ereport(PANIC, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+							errmsg("error reading downlink %X/%X in relfile (%u, %u)",
+								   (uint32) (downlink >> 32), (uint32) (downlink),
+								   desc->oids.datoid, desc->oids.relnode),
+							errdetail("Hikeys don't match.")));
 		refind_page(context, NULL, BTreeKeyRightmost, PAGE_GET_LEVEL(page) + 1,
 					parent_blkno, parent_change_count);
 	}
@@ -1405,6 +1498,14 @@ load_page(OBTreeFindPageContext *context)
 		OTuple		hikey;
 
 		BTREE_PAGE_GET_HIKEY(hikey, page);
+
+		if (O_TUPLE_IS_NULL(target_hikey.tuple) ||
+			o_btree_cmp(desc, &hikey, BTreeKeyNonLeafKey, &target_hikey, BTreeKeyNonLeafKey) != 0)
+			ereport(PANIC, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+							errmsg("error reading downlink %X/%X in relfile (%u, %u)",
+								   (uint32) (downlink >> 32), (uint32) (downlink),
+								   desc->oids.datoid, desc->oids.relnode),
+							errdetail("Hikeys don't match.")));
 		refind_page(context, &hikey, BTreeKeyPageHiKey,
 					PAGE_GET_LEVEL(page) + 1, parent_blkno, parent_change_count);
 	}
@@ -1675,7 +1776,7 @@ perform_page_io(BTreeDescr *desc, OInMemoryBlkno blkno,
 	if (err)
 	{
 		ereport(PANIC, (errcode_for_file_access(),
-						errmsg("could not (re) allocate file blocks for page %d to file %s",
+						errmsg("could not (re) allocate file blocks for page %d to file %s: %m",
 							   blkno, btree_smgr_filename(desc, 0, checkpoint_number))));
 	}
 
@@ -1684,7 +1785,7 @@ perform_page_io(BTreeDescr *desc, OInMemoryBlkno blkno,
 	if (!write_page_to_disk(desc, &page_desc->fileExtent, checkpoint_number, write_img, write_size))
 	{
 		ereport(PANIC, (errcode_for_file_access(),
-						errmsg("could not write page %d to file %s with offset %lu",
+						errmsg("could not write page %d to file %s with offset %lu: %m",
 							   blkno,
 							   btree_smgr_filename(desc, page_desc->fileExtent.off, checkpoint_number),
 							   (unsigned long) page_desc->fileExtent.off)));
@@ -1715,7 +1816,7 @@ perform_page_io_autonomous(BTreeDescr *desc, uint32 chkpNum, Page img, FileExten
 	if (!get_free_disk_extent(desc, chkpNum, write_size, extent))
 	{
 		ereport(PANIC, (errcode_for_file_access(),
-						errmsg("could not get free file offset for write page to file %s",
+						errmsg("could not get free file offset for write page to file %s: %m",
 							   btree_smgr_filename(desc, 0, 0))));
 
 		return InvalidDiskDownlink;
@@ -1739,7 +1840,7 @@ perform_page_io_autonomous(BTreeDescr *desc, uint32 chkpNum, Page img, FileExten
 		}
 
 		ereport(PANIC, (errcode_for_file_access(),
-						errmsg("could not write autonomous page to file %s with offset %lu",
+						errmsg("could not write autonomous page to file %s with offset %lu: %m",
 							   btree_smgr_filename(desc, offset, chkpNum),
 							   (unsigned long) offset)));
 
@@ -1826,7 +1927,7 @@ perform_page_io_build(BTreeDescr *desc, Page img,
 	if (!write_page_to_disk(desc, extent, 0, write_img, write_size))
 	{
 		ereport(PANIC, (errcode_for_file_access(),
-						errmsg("could not write autonomous page to file %s with offset %lu",
+						errmsg("could not write autonomous page to file %s with offset %lu: %m",
 							   btree_smgr_filename(desc, extent[0].off, chkpNum),
 							   (unsigned long) extent[0].off)));
 
@@ -2003,7 +2104,7 @@ write_page(OBTreeFindPageContext *context, OInMemoryBlkno blkno, Page img,
 				page_desc->ionum = -1;
 				unlock_io(ionum);
 				ereport(ERROR, (errcode_for_file_access(),
-								errmsg("could not evict page %d to disk", blkno)));
+								errmsg("could not evict page %d to disk: %m", blkno)));
 			}
 			else if (!dirty_parent)
 			{
@@ -2053,7 +2154,7 @@ write_page(OBTreeFindPageContext *context, OInMemoryBlkno blkno, Page img,
 				unlock_io(ionum);
 				unlock_page(parent_blkno);
 				ereport(ERROR, (errcode_for_file_access(),
-								errmsg("could not evict page %d to disk", blkno)));
+								errmsg("could not evict page %d to disk: %m", blkno)));
 			}
 			else
 			{
@@ -2216,6 +2317,7 @@ evict_btree(BTreeDescr *desc, uint32 checkpoint_number)
 	evicted_tree_data.maxLocation[1] = metaPage->partsInfo[1].writeMaxLocation;
 	evicted_tree_data.dirtyFlag1 = metaPage->dirtyFlag1;
 	evicted_tree_data.dirtyFlag2 = metaPage->dirtyFlag2;
+	evicted_tree_data.punchHolesChkpNum = metaPage->punchHolesChkpNum;
 
 	notModified = (!metaPage->dirtyFlag1 && !metaPage->dirtyFlag2);
 
@@ -2418,7 +2520,7 @@ retry:
 		init_page_find_context(&context, desc, COMMITSEQNO_INPROGRESS, BTREE_PAGE_FIND_MODIFY
 							   | BTREE_PAGE_FIND_TRY_LOCK
 							   | BTREE_PAGE_FIND_DOWNLINK_LOCATION
-							   | (evict ? BTREE_PAGE_FIND_NO_FIX_SPLIT : 0));
+							   | BTREE_PAGE_FIND_NO_FIX_SPLIT);
 		if (O_PAGE_IS(p, RIGHTMOST))
 		{
 			found = find_page(&context, NULL, BTreeKeyRightmost, PAGE_GET_LEVEL(p) + 1);
@@ -2595,11 +2697,12 @@ write_tree_pages_recursive(UndoLogType undoType,
 	{
 		while (true)
 		{
-			reserve_undo_size(undoType, 2 * O_MERGE_UNDO_IMAGE_SIZE);
+			reserve_undo_size(GET_PAGE_LEVEL_UNDO_TYPE(undoType),
+							  2 * O_MERGE_UNDO_IMAGE_SIZE);
 			if (walk_page(blkno, evict) != OWalkPageMerged)
 				break;
 		}
-		release_undo_size(undoType);
+		release_undo_size(GET_PAGE_LEVEL_UNDO_TYPE(undoType));
 	}
 
 	return true;
@@ -2980,4 +3083,113 @@ bool
 fsync_btree_files(Oid datoid, Oid relnode)
 {
 	return iterate_relnode_files(datoid, relnode, fsync_callback, NULL);
+}
+
+void
+try_to_punch_holes(BTreeDescr *desc)
+{
+	BTreeMetaPage *metaPage;
+	File		file;
+	uint64		file_size;
+	char	   *filename,
+				buf[ORIOLEDB_BLCKSZ];
+	uint64		len = 0,
+				i,
+				buf_len;
+	uint32		chkp_num;
+	LWLock	   *metaLock;
+	LWLock	   *punchHolesLock;
+
+	Assert(orioledb_use_sparse_files);
+	Assert(!OCompressIsValid(desc->compress));
+
+	o_btree_load_shmem(desc);
+	metaPage = BTREE_GET_META(desc);
+	metaLock = &metaPage->metaLock;
+	punchHolesLock = &metaPage->punchHolesLock;
+
+	chkp_num = metaPage->punchHolesChkpNum + 1;
+	while (can_use_checkpoint_extents(desc, chkp_num))
+	{
+		SeqBufTag	tag;
+		bool		removeFile = false;
+
+		LWLockAcquire(punchHolesLock, LW_EXCLUSIVE);
+
+		if (chkp_num == metaPage->punchHolesChkpNum + 1)
+		{
+			if (chkp_num < metaPage->freeBuf.tag.num)
+				removeFile = true;
+		}
+		else
+		{
+			chkp_num = metaPage->punchHolesChkpNum + 1;
+			/* Try for next checkpoint number */
+			LWLockRelease(punchHolesLock);
+			continue;
+		}
+
+		tag.datoid = desc->oids.datoid;
+		tag.relnode = desc->oids.relnode;
+		tag.type = 't';
+		tag.num = chkp_num;
+		if (!seq_buf_file_exist(&tag))
+		{
+			/* table may be deleted or *.tmp file not created */
+			LWLockAcquire(metaLock, LW_EXCLUSIVE);
+			Assert(chkp_num == metaPage->punchHolesChkpNum + 1);
+			metaPage->punchHolesChkpNum = chkp_num;
+			LWLockRelease(metaLock);
+			LWLockRelease(punchHolesLock);
+			chkp_num++;
+			continue;
+		}
+
+		/* free extents from *.tmp file */
+		filename = get_seq_buf_filename(&tag);
+		file = PathNameOpenFile(filename, O_RDONLY | PG_BINARY);
+		if (file < 0)
+			ereport(FATAL, (errcode_for_file_access(),
+							errmsg("could not open file %s: %m", filename)));
+		file_size = FileSize(file);
+
+		while (true)
+		{
+			BlockNumber *cur_off;
+
+			buf_len = OFileRead(file, buf, ORIOLEDB_BLCKSZ, len, WAIT_EVENT_DATA_FILE_READ);
+			if (buf_len <= 0)
+				break;
+
+			cur_off = (BlockNumber *) buf;
+			for (i = 0; i < buf_len; i += sizeof(BlockNumber))
+			{
+				btree_smgr_punch_hole(desc, chkp_num,
+									  (off_t) (*cur_off) * (off_t) ORIOLEDB_BLCKSZ,
+									  ORIOLEDB_BLCKSZ);
+				cur_off++;
+			}
+			len += buf_len;
+		}
+		if (file_size != len)
+			ereport(FATAL, (errcode_for_file_access(),
+							errmsg("could not read data from checkpoint tmp file: %s %lu %lu: %m",
+								   filename, len, file_size)));
+
+		pfree(filename);
+		FileClose(file);
+
+		if (removeFile)
+			seq_buf_remove_file(&tag);
+
+		LWLockAcquire(metaLock, LW_EXCLUSIVE);
+		Assert(chkp_num == metaPage->punchHolesChkpNum + 1);
+		metaPage->punchHolesChkpNum = chkp_num;
+		LWLockRelease(metaLock);
+
+		LWLockRelease(punchHolesLock);
+
+		/* Try for next checkpoint number */
+		chkp_num++;
+	}
 }

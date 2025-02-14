@@ -65,8 +65,8 @@ static void clean_chain_has_locks_flag(UndoLogType undoType,
  * Add page image to the undo log.
  */
 UndoLocation
-page_add_item_to_undo(BTreeDescr *desc, Pointer p, CommitSeqNo imageCsn,
-					  OTuple *splitKey, LocationIndex splitKeyLen)
+page_add_image_to_undo(BTreeDescr *desc, Pointer p, CommitSeqNo imageCsn,
+					   OTuple *splitKey, LocationIndex splitKeyLen)
 {
 	UndoPageImageHeader *header;
 	UndoLocation undoLocation;
@@ -76,10 +76,12 @@ page_add_item_to_undo(BTreeDescr *desc, Pointer p, CommitSeqNo imageCsn,
 
 	Assert(desc->undoType != UndoLogNone);
 	if (splitKey)
-		ptr = get_undo_record(desc->undoType, &undoLocation,
+		ptr = get_undo_record(GET_PAGE_LEVEL_UNDO_TYPE(desc->undoType),
+							  &undoLocation,
 							  O_SPLIT_UNDO_IMAGE_SIZE(splitKeyLen));
 	else
-		ptr = get_undo_record(desc->undoType, &undoLocation,
+		ptr = get_undo_record(GET_PAGE_LEVEL_UNDO_TYPE(desc->undoType),
+							  &undoLocation,
 							  O_COMPACT_UNDO_IMAGE_SIZE);
 
 	header = (UndoPageImageHeader *) ptr;
@@ -646,7 +648,7 @@ add_pending_truncate(ORelOids relOids, int numTrees, ORelOids *treeOids)
 											O_RDWR | O_CREAT | PG_BINARY);
 	if (pendingTruncatesFile < 0)
 		ereport(FATAL, (errcode_for_file_access(),
-						errmsg("could not open pending truncates file %s",
+						errmsg("could not open pending truncates file %s: %m",
 							   PENDING_TRUNCATES_FILENAME)));
 
 	offset = pending_truncates_meta->pendingTruncatesLocation;
@@ -655,7 +657,7 @@ add_pending_truncate(ORelOids relOids, int numTrees, ORelOids *treeOids)
 	if (FileWrite(pendingTruncatesFile, (Pointer) &relOids, length, offset,
 				  WAIT_EVENT_BUFFILE_WRITE) != length)
 		ereport(FATAL, (errcode_for_file_access(),
-						errmsg("could not write pending truncates file %s",
+						errmsg("could not write pending truncates file %s: %m",
 							   PENDING_TRUNCATES_FILENAME)));
 
 	offset += length;
@@ -664,7 +666,7 @@ add_pending_truncate(ORelOids relOids, int numTrees, ORelOids *treeOids)
 	if (FileWrite(pendingTruncatesFile, (Pointer) &numTrees, length, 0,
 				  WAIT_EVENT_BUFFILE_WRITE) != length)
 		ereport(FATAL, (errcode_for_file_access(),
-						errmsg("could not write pending truncates file %s",
+						errmsg("could not write pending truncates file %s: %m",
 							   PENDING_TRUNCATES_FILENAME)));
 
 	offset += length;
@@ -673,7 +675,7 @@ add_pending_truncate(ORelOids relOids, int numTrees, ORelOids *treeOids)
 	if (FileWrite(pendingTruncatesFile, (Pointer) &treeOids, length, 0,
 				  WAIT_EVENT_BUFFILE_WRITE) != length)
 		ereport(FATAL, (errcode_for_file_access(),
-						errmsg("could not write pending truncates file %s",
+						errmsg("could not write pending truncates file %s: %m",
 							   PENDING_TRUNCATES_FILENAME)));
 
 	offset += length;
@@ -715,7 +717,7 @@ check_pending_truncates(void)
 											O_RDONLY | PG_BINARY);
 	if (pendingTruncatesFile < 0)
 		ereport(FATAL, (errcode_for_file_access(),
-						errmsg("could not open pending truncates file %s",
+						errmsg("could not open pending truncates file %s: %m",
 							   PENDING_TRUNCATES_FILENAME)));
 
 	offset = 0;
@@ -728,7 +730,7 @@ check_pending_truncates(void)
 		if (FileRead(pendingTruncatesFile, (Pointer) &relOids, length, offset,
 					 WAIT_EVENT_BUFFILE_READ) != length)
 			ereport(FATAL, (errcode_for_file_access(),
-							errmsg("could not read pending truncates file %s",
+							errmsg("could not read pending truncates file %s: %m",
 								   PENDING_TRUNCATES_FILENAME)));
 
 		offset += length;
@@ -737,7 +739,7 @@ check_pending_truncates(void)
 		if (FileRead(pendingTruncatesFile, (Pointer) &numTrees, length, offset,
 					 WAIT_EVENT_BUFFILE_READ) != length)
 			ereport(FATAL, (errcode_for_file_access(),
-							errmsg("could not read pending truncates file %s",
+							errmsg("could not read pending truncates file %s: %m",
 								   PENDING_TRUNCATES_FILENAME)));
 
 		if (numTrees > relNodesAllocated)
@@ -755,7 +757,7 @@ check_pending_truncates(void)
 		if (FileRead(pendingTruncatesFile, (Pointer) relNodes, length, offset,
 					 WAIT_EVENT_BUFFILE_READ) != length)
 			ereport(FATAL, (errcode_for_file_access(),
-							errmsg("could not read pending truncates file %s",
+							errmsg("could not read pending truncates file %s: %m",
 								   PENDING_TRUNCATES_FILENAME)));
 
 		for (i = 0; i < numTrees; i++)
@@ -989,8 +991,9 @@ get_page_from_undo(BTreeDescr *desc, UndoLocation undoLocation, Pointer key,
 	UndoLocation left_loc,
 				right_loc;
 	LocationIndex loc = 0;
+	UndoLogType undoType = GET_PAGE_LEVEL_UNDO_TYPE(desc->undoType);
 
-	undo_read(desc->undoType, undoLocation,
+	undo_read(undoType, undoLocation,
 			  sizeof(UndoPageImageHeader), (Pointer) &header);
 	left_loc = undoLocation + MAXALIGN(sizeof(UndoPageImageHeader));
 
@@ -1008,7 +1011,7 @@ get_page_from_undo(BTreeDescr *desc, UndoLocation undoLocation, Pointer key,
 			*is_left = true;
 		if (is_right != NULL)
 			*is_right = true;
-		undo_read(desc->undoType, left_loc, ORIOLEDB_BLCKSZ, dest);
+		undo_read(undoType, left_loc, ORIOLEDB_BLCKSZ, dest);
 		if (page_lokey && header.type == UndoPageImageSplit)
 		{
 			bool		set_page_lokey = false;
@@ -1028,7 +1031,7 @@ get_page_from_undo(BTreeDescr *desc, UndoLocation undoLocation, Pointer key,
 
 			if (set_page_lokey)
 			{
-				undo_read(desc->undoType,
+				undo_read(undoType,
 						  left_loc + ORIOLEDB_BLCKSZ,
 						  header.splitKeyLen,
 						  page_lokey->fixedData);
@@ -1051,17 +1054,17 @@ get_page_from_undo(BTreeDescr *desc, UndoLocation undoLocation, Pointer key,
 		case BTreeKeyNone:
 			if (is_left != NULL)
 				*is_left = true;
-			undo_read(desc->undoType, left_loc, ORIOLEDB_BLCKSZ, dest);
+			undo_read(undoType, left_loc, ORIOLEDB_BLCKSZ, dest);
 			break;
 		case BTreeKeyRightmost:
 			if (is_right != NULL)
 				*is_right = true;
 			if (lokey != NULL)
 			{
-				read_hikey_from_undo(desc->undoType, left_loc, dest, &loc);
+				read_hikey_from_undo(undoType, left_loc, dest, &loc);
 				copy_fixed_hikey(desc, lokey, dest);
 			}
-			undo_read(desc->undoType, right_loc, ORIOLEDB_BLCKSZ, dest);
+			undo_read(undoType, right_loc, ORIOLEDB_BLCKSZ, dest);
 			break;
 		case BTreeKeyLeafTuple:
 		case BTreeKeyNonLeafKey:
@@ -1069,7 +1072,7 @@ get_page_from_undo(BTreeDescr *desc, UndoLocation undoLocation, Pointer key,
 		case BTreeKeyPageHiKey:
 			Assert(key != NULL);
 
-			read_hikey_from_undo(desc->undoType, left_loc, dest, &loc);
+			read_hikey_from_undo(undoType, left_loc, dest, &loc);
 
 			cmp_expected = kind == BTreeKeyPageHiKey ? 1 : 0;
 			kind = kind == BTreeKeyPageHiKey ? BTreeKeyNonLeafKey : kind;
@@ -1083,13 +1086,13 @@ get_page_from_undo(BTreeDescr *desc, UndoLocation undoLocation, Pointer key,
 					*is_right = true;
 				if (lokey != NULL)
 					copy_fixed_hikey(desc, lokey, dest);
-				undo_read(desc->undoType, right_loc, ORIOLEDB_BLCKSZ, dest);
+				undo_read(undoType, right_loc, ORIOLEDB_BLCKSZ, dest);
 			}
 			else
 			{
 				if (is_left != NULL)
 					*is_left = true;
-				undo_read(desc->undoType, left_loc + loc, ORIOLEDB_BLCKSZ - loc, dest + loc);
+				undo_read(undoType, left_loc + loc, ORIOLEDB_BLCKSZ - loc, dest + loc);
 			}
 			break;
 		default:
@@ -1107,11 +1110,13 @@ make_merge_undo_image(BTreeDescr *desc, Pointer left,
 	UndoPageImageHeader *header;
 	UndoLocation undoLocation;
 	Pointer		undo_rec;
+	UndoLogType undoType = GET_PAGE_LEVEL_UNDO_TYPE(desc->undoType);
 
 	Assert(O_PAGE_IS(left, LEAF) && O_PAGE_IS(right, LEAF));
 
-	Assert(desc->undoType != UndoLogNone);
-	undo_rec = get_undo_record(desc->undoType, &undoLocation, O_MERGE_UNDO_IMAGE_SIZE);
+	Assert(undoType != UndoLogNone);
+	undo_rec = get_undo_record(GET_PAGE_LEVEL_UNDO_TYPE(undoType),
+							   &undoLocation, O_MERGE_UNDO_IMAGE_SIZE);
 
 	header = (UndoPageImageHeader *) undo_rec;
 	header->type = UndoPageImageMerge;

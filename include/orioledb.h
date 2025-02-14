@@ -32,6 +32,17 @@
 #include "utils/rel.h"
 #include "utils/relcache.h"
 
+#if defined __has_include
+#if __has_include ("sanitizer/asan_interface.h")
+#include "sanitizer/asan_interface.h"
+#endif
+#endif
+
+#ifndef ASAN_UNPOISON_MEMORY_REGION
+#define ASAN_UNPOISON_MEMORY_REGION(addr, size) \
+  ((void)(addr), (void)(size))
+#endif
+
 #define ORIOLEDB_VERSION "OrioleDB public beta 9"
 #define ORIOLEDB_BINARY_VERSION 5
 #define ORIOLEDB_DATA_DIR "orioledb_data"
@@ -101,17 +112,25 @@ typedef enum
 	UndoLogNone = -1,
 
 	/*
-	 * Undo log for modification of user data.
+	 * Undo log for row-level record of modifications of user data.
 	 */
 	UndoLogRegular = 0,
 
 	/*
+	 * Undo log for page-level record of modifications of user data.
+	 */
+	UndoLogRegularPageLevel = 1,
+
+	/*
 	 * Undo log for modification of system trees.
 	 */
-	UndoLogSystem = 1,
+	UndoLogSystem = 2,
 
-	UndoLogsCount = 2
+	UndoLogsCount = 3
 } UndoLogType;
+
+#define GET_PAGE_LEVEL_UNDO_TYPE(undoType) \
+	(((undoType) == UndoLogRegular) ? UndoLogRegularPageLevel : (undoType))
 
 typedef struct
 {
@@ -281,9 +300,9 @@ extern Size orioledb_buffers_size;
 extern Size orioledb_buffers_count;
 extern Size undo_circular_buffer_size;
 extern uint32 undo_buffers_count;
-extern Size undo_system_circular_buffer_size;
-extern uint32 undo_system_buffers_count;
 extern Size xid_circular_buffer_size;
+extern double regular_block_undo_circular_buffer_fraction;
+extern double system_undo_circular_buffer_fraction;
 extern uint32 xid_buffers_count;
 extern Pointer o_shared_buffers;
 extern ODBProcData *oProcData;
@@ -298,6 +317,7 @@ extern double o_checkpoint_completion_ratio;
 extern int	max_io_concurrency;
 extern bool use_mmap;
 extern bool use_device;
+extern bool orioledb_use_sparse_files;
 extern int	device_fd;
 extern char *device_filename;
 extern Pointer mmap_data;

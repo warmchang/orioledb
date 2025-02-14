@@ -66,6 +66,8 @@
 #include "utils/sampling.h"
 #include "utils/syscache.h"
 
+bool		in_nontransactional_truncate = false;
+
 typedef struct OScanDescData
 {
 	TableScanDescData rs_base;	/* AM independent part of the descriptor */
@@ -422,6 +424,8 @@ orioledb_tuple_delete(Relation relation, Datum tupleid, CommandId cid,
 	BTreeLocationHint hint;
 	OSnapshot	oSnapshot;
 
+	ASAN_UNPOISON_MEMORY_REGION(tmfd, sizeof(*tmfd));
+
 	if (snapshot)
 		O_LOAD_SNAPSHOT(&oSnapshot, snapshot);
 	else
@@ -474,6 +478,7 @@ orioledb_tuple_delete(Relation relation, Datum tupleid, CommandId cid,
 	}
 	else
 	{
+		ASAN_UNPOISON_MEMORY_REGION(&tmfd->ctid, sizeof(tmfd->ctid));
 		ItemPointerSet(&tmfd->ctid, 0, FirstOffsetNumber);
 	}
 
@@ -512,6 +517,8 @@ orioledb_tuple_update(Relation relation, Datum tupleid, TupleTableSlot *slot,
 	OXid		oxid;
 	BTreeLocationHint hint;
 	OSnapshot	oSnapshot;
+
+	ASAN_UNPOISON_MEMORY_REGION(tmfd, sizeof(*tmfd));
 
 	if (snapshot)
 		O_LOAD_SNAPSHOT(&oSnapshot, snapshot);
@@ -576,6 +583,7 @@ orioledb_tuple_update(Relation relation, Datum tupleid, TupleTableSlot *slot,
 	}
 	else
 	{
+		ASAN_UNPOISON_MEMORY_REGION(&tmfd->ctid, sizeof(tmfd->ctid));
 		ItemPointerSet(&tmfd->ctid, 0, FirstOffsetNumber);
 	}
 
@@ -658,6 +666,7 @@ orioledb_tuple_lock(Relation rel, Datum tupleid, Snapshot snapshot,
 	}
 	else
 	{
+		ASAN_UNPOISON_MEMORY_REGION(&tmfd->ctid, sizeof(tmfd->ctid));
 		ItemPointerSet(&tmfd->ctid, 0, FirstOffsetNumber);
 	}
 
@@ -787,6 +796,9 @@ static void
 orioledb_relation_nontransactional_truncate(Relation rel)
 {
 	ORelOids	oids;
+
+	if (rel->rd_rel->relpersistence == RELPERSISTENCE_TEMP)
+		in_nontransactional_truncate = true;
 
 	ORelOidsSetFromRel(oids, rel);
 	if (!OidIsValid(rel->rd_rel->oid) || rel->rd_rel->relkind == RELKIND_TOASTVALUE)

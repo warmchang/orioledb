@@ -270,7 +270,7 @@ class S3Test(S3BaseTest):
 
 		assert e.exception.message is not None
 		self.assertTrue(
-		    e.exception.message.startswith(
+		    self.stripErrorMsg(e.exception.message).startswith(
 		        "ERROR:  checkpoint request failed"))
 
 		with open(node.pg_log_file) as f:
@@ -301,7 +301,7 @@ class S3Test(S3BaseTest):
 
 		assert e.exception.message is not None
 		self.assertTrue(
-		    e.exception.message.startswith(
+		    self.stripErrorMsg(e.exception.message).startswith(
 		        "ERROR:  checkpoint request failed"))
 
 		with open(node.pg_log_file) as f:
@@ -322,7 +322,7 @@ class S3Test(S3BaseTest):
 
 		assert e.exception.message is not None
 		self.assertTrue(
-		    e.exception.message.startswith(
+		    self.stripErrorMsg(e.exception.message).startswith(
 		        "ERROR:  checkpoint request failed"))
 
 		with open(node.pg_log_file) as f:
@@ -345,7 +345,7 @@ class S3Test(S3BaseTest):
 
 		assert e.exception.message is not None
 		self.assertTrue(
-		    e.exception.message.startswith(
+		    self.stripErrorMsg(e.exception.message).startswith(
 		        "ERROR:  checkpoint request failed"))
 
 		with open(node.pg_log_file) as f:
@@ -767,7 +767,7 @@ class S3Test(S3BaseTest):
 			node.stop()
 
 			# Test that PostgreSQL won't start in case of absent control file
-			new_node = self.initNode(self.getBasePort() + 1)
+			new_node = self.initNode(self.getBasePort() + 1, 'tgsb')
 			new_node.append_conf(f"""
 				orioledb.s3_mode = true
 				orioledb.s3_host = '{self.host}:{self.port}/{self.bucket_name}'

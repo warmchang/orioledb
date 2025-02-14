@@ -12,7 +12,9 @@ import time
 import hashlib
 import base64
 import inspect
+import shutil
 from tempfile import mkdtemp
+from typing import Any
 
 from threading import Thread
 from testgres.enums import NodeStatus
@@ -42,7 +44,12 @@ class BaseTest(unittest.TestCase):
 
 	def getReplica(self) -> testgres.PostgresNode:
 		if self.replica is None:
-			baseDir = mkdtemp(prefix=self.myName + '_tgsb_')
+			(test_path, t) = os.path.split(
+			    os.path.dirname(inspect.getfile(self.__class__)))
+			baseDir = os.path.join(test_path, 'tmp_check_t',
+			                       self.myName + '_tgsb')
+			if os.path.exists(baseDir):
+				shutil.rmtree(baseDir)
 			replica = self.node.backup(
 			    base_dir=baseDir).spawn_replica('replica')
 			replica.port = self.getBasePort() + 1
@@ -50,12 +57,18 @@ class BaseTest(unittest.TestCase):
 			self.replica = replica
 		return self.replica
 
-	def initNode(self, port) -> testgres.PostgresNode:
-		baseDir = mkdtemp(prefix=self.myName + '_tgsn_')
+	def initNode(self, port, suffix='tgsn') -> testgres.PostgresNode:
+		(test_path,
+		 t) = os.path.split(os.path.dirname(inspect.getfile(self.__class__)))
+		baseDir = os.path.join(test_path, 'tmp_check_t',
+		                       self.myName + '_' + suffix)
+		if os.path.exists(baseDir):
+			shutil.rmtree(baseDir)
 		node = testgres.get_new_node('test', port=port, base_dir=baseDir)
 		node.init(["--no-locale", "--encoding=UTF8"])  # run initdb
-		node.append_conf('postgresql.conf',
-		                 "shared_preload_libraries = orioledb\n")
+		node.append_conf(
+		    'postgresql.conf', "shared_preload_libraries = orioledb\n"
+		    "orioledb.use_sparse_files = true\n")
 		return node
 
 	@property
@@ -122,6 +135,14 @@ class BaseTest(unittest.TestCase):
 			i = i + 1
 		return result[0:length].decode('ascii')
 
+	def stripErrorMsg(self, msg):
+		prefix = "Utility exited with non-zero code. Error: `"
+		if msg.startswith(prefix):
+			msg = msg[len(prefix):]
+		if msg.endswith('`'):
+			msg = msg[:-1]
+		return msg
+
 	def assertErrorMessageEquals(self,
 	                             e: Exception,
 	                             err_msg: str,
@@ -146,6 +167,11 @@ class BaseTest(unittest.TestCase):
 		else:
 			exp_msg = err_msg
 			msg = e.args[0]['M']
+
+		msg = self.stripErrorMsg(msg)
+		msg = msg.rstrip("\r\n")
+		exp_msg = exp_msg.rstrip("\r\n")
+
 		self.assertEqual(msg, exp_msg)
 
 	@staticmethod
@@ -166,6 +192,19 @@ class BaseTest(unittest.TestCase):
 		replica.catchup()
 		replica.poll_query_until("SELECT orioledb_recovery_synchronized();",
 		                         expected=True)
+
+	@staticmethod
+	def sparse_files_supported():
+		(test_path, t) = os.path.split(os.path.dirname(__file__))
+		tmp_check_path = os.path.join(test_path, 'tmp_check_t')
+		if not os.path.exists(tmp_check_path):
+			os.makedirs(tmp_check_path)
+		fname = os.path.join(tmp_check_path, 'sparse_file_test')
+		fp = open(fname, 'wb')
+		fp.truncate(1024 * 16)
+		fp.close()
+		stat = os.stat(fname)
+		return (stat.st_blocks == 0)
 
 
 # execute SQL query Thread for PostgreSql node's connection
@@ -255,6 +294,72 @@ def new_execute(self, query, *args):
 		return res
 	except Exception as e:
 		return None
+
+
+# Convert output of orioledb_tbl_structure/orioledb_idx_structure to json
+def tbl_structure_to_json(structure: str) -> dict[str, dict[int, Any]]:
+	res = dict()
+	cur_index = None
+	cur_page = None
+
+	# TODO Currently limited information is parsed from the ouput of the
+	# orioledb_tbl_structure() function. Add more information to the output
+	# JSON object.
+
+	index_pattern_str = r"Index (.+) contents"
+	index_pattern = re.compile(index_pattern_str)
+
+	page_pattern_str = r"Page (?P<page>\d+?): level = (?P<level>\d+?)(?:, \S+ = \d+)*(?P<sparse>, sparse)?"
+	page_pattern = re.compile(page_pattern_str)
+
+	hikey_pattern_str = r"\s+Hikey: offset = \d+, key = (.+)"
+	hikey_pattern = re.compile(hikey_pattern_str)
+
+	for line in structure.splitlines():
+		line = line.rstrip()
+
+		# Match an index
+		m = index_pattern.search(line)
+		if m is not None:
+			if m.group(1) not in res:
+				cur_index = dict()
+				res[m.group(1)] = cur_index
+			else:
+				raise Exception(f"Duplicate index entry {m.group(1)}")
+
+			continue
+
+		if cur_index is None:
+			raise Exception("Invalid table structure")
+
+		# Match a page
+		m = page_pattern.search(line)
+		if m is not None:
+			line_dict = m.groupdict()
+
+			level = int(line_dict["level"])
+			if level not in cur_index:
+				cur_index[level] = dict()
+
+			cur_level = cur_index[level]
+
+			pagenum = int(line_dict["page"])
+			if pagenum not in cur_level:
+				cur_level[pagenum] = dict()
+
+			cur_page = cur_level[pagenum]
+			cur_page["is_sparse"] = line_dict["sparse"] is not None
+
+			continue
+
+		if cur_page is None:
+			raise Exception("Invalid table structure")
+
+		m = hikey_pattern.search(line)
+		if m is not None:
+			cur_page["hikey"] = m.group(1)
+
+	return res
 
 
 testgres.NodeConnection.execute = new_execute

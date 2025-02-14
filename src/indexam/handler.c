@@ -198,12 +198,13 @@ orioledb_ambuild(Relation heap, Relation index, IndexInfo *indexInfo)
 	result->heap_tuples = 0.0;
 	result->index_tuples = 0.0;
 
-	if (!index->rd_index->indisprimary && !OidIsValid(o_saved_relrewrite))
+	if (in_nontransactional_truncate || (!index->rd_index->indisprimary && !OidIsValid(o_saved_relrewrite)))
 	{
 		ORelOids	tbl_oids;
 
 		ORelOidsSetFromRel(tbl_oids, heap);
-		o_define_index_validate(tbl_oids, index, indexInfo, NULL);
+		if (!in_nontransactional_truncate)
+			o_define_index_validate(tbl_oids, index, indexInfo, NULL);
 		o_define_index(heap, index, InvalidOid, reindex, InvalidIndexNumber, result);
 	}
 
@@ -324,7 +325,7 @@ append_rowid_values(OIndexDescr *id,
 		*csn = add->csn;
 		*version = o_tuple_get_version(tuple);
 
-		if (id->nPrimaryFields < id->nFields)
+		if (id->nPrimaryFields <= id->nFields)
 		{
 			int			i;
 			int			pk_from;
@@ -409,7 +410,6 @@ orioledb_aminsert(Relation rel, Datum *values, bool *isnull,
 	TupleTableSlot *slot;
 	uint32		version;
 	OTuple		tuple;
-	int			skipped = 0;
 	CommitSeqNo csn;
 
 	if (OidIsValid(rel->rd_rel->relrewrite))
@@ -440,25 +440,29 @@ orioledb_aminsert(Relation rel, Datum *values, bool *isnull,
 	}
 	Assert(ix_num < descr->nIndices);
 
-	/* TODO: Run this only when fields amount differs */
-	/* Remove duplicates like we do in orioledb tables */
-	for (int copy_from = 0; copy_from < rel->rd_att->natts; copy_from++)
+	if (index_descr->leafTupdesc->natts != rel->rd_att->natts)
 	{
-		Form_pg_attribute orig_attr = &rel->rd_att->attrs[copy_from];
-		Form_pg_attribute idx_attr;
+		/* Remove duplicates like we do in orioledb tables */
+		int			skipped = 0;
 
-		if (copy_from - skipped >= index_descr->leafTupdesc->natts)
-			break;
-
-		idx_attr = &index_descr->leafTupdesc->attrs[copy_from - skipped];
-
-		if (strncmp(orig_attr->attname.data, idx_attr->attname.data, NAMEDATALEN) == 0)
+		for (int copy_from = 0; copy_from < rel->rd_att->natts; copy_from++)
 		{
-			if (skipped > 0)
-				values[copy_from - skipped] = values[copy_from];
+			Form_pg_attribute orig_attr = &rel->rd_att->attrs[copy_from];
+			Form_pg_attribute idx_attr;
+
+			if (copy_from - skipped >= index_descr->leafTupdesc->natts)
+				break;
+
+			idx_attr = &index_descr->leafTupdesc->attrs[copy_from - skipped];
+
+			if (strncmp(orig_attr->attname.data, idx_attr->attname.data, NAMEDATALEN) == 0)
+			{
+				if (skipped > 0)
+					values[copy_from - skipped] = values[copy_from];
+			}
+			else
+				skipped++;
 		}
-		else
-			skipped++;
 	}
 	append_rowid_values(index_descr,
 						GET_PRIMARY(descr)->nonLeafTupdesc,
@@ -1255,8 +1259,8 @@ orioledb_ambeginscan(Relation rel, int nkeys, int norderbys)
 	return scan;
 }
 
-static int
-get_num_prefix_exact_keys(ScanKey scankey, int nscankeys)
+int
+o_get_num_prefix_exact_keys(ScanKey scankey, int nscankeys)
 {
 	AttrNumber	prevAttr = 0;
 	int			i;
@@ -1281,7 +1285,7 @@ orioledb_amrescan(IndexScanDesc scan, ScanKey scankey, int nscankeys,
 	MemoryContextReset(o_scan->cxt);
 	o_scan->iterator = NULL;
 	o_scan->curKeyRangeIsLoaded = false;
-	o_scan->numPrefixExactKeys = get_num_prefix_exact_keys(scankey, nscankeys);
+	o_scan->numPrefixExactKeys = o_get_num_prefix_exact_keys(scankey, nscankeys);
 	btrescan(scan, scankey, nscankeys, orderbys, norderbys);
 }
 
@@ -1384,7 +1388,7 @@ fill_itup(IndexScanDesc scan, OTuple tuple, OTableDescr *descr,
 		result_size = MAXALIGN(VARHDRSZ) +
 			MAXALIGN(sizeof(ORowIdAddendumCtid)) +
 			sizeof(ItemPointerData);
-		rowid = (bytea *) MemoryContextAllocZero(slot->tts_mcxt, result_size);
+		rowid = (bytea *) palloc(result_size);
 		SET_VARSIZE(rowid, result_size);
 		ptr = (Pointer) rowid + MAXALIGN(VARHDRSZ);
 		memcpy(ptr, &addCtid, sizeof(ORowIdAddendumCtid));
@@ -1429,7 +1433,7 @@ fill_itup(IndexScanDesc scan, OTuple tuple, OTableDescr *descr,
 		tuple_size = o_new_tuple_size(pk_tupdesc, pk_spec, NULL, 0, rowid_values, rowid_isnull, NULL);
 		result_size = MAXALIGN(VARHDRSZ) + MAXALIGN(sizeof(ORowIdAddendumNonCtid));
 		result_size += tuple_size;
-		rowid = (bytea *) MemoryContextAllocZero(slot->tts_mcxt, result_size);
+		rowid = (bytea *) palloc(result_size);
 		SET_VARSIZE(rowid, result_size);
 		ptr = (Pointer) rowid + MAXALIGN(VARHDRSZ);
 		memcpy(ptr, &addNonCtid, sizeof(ORowIdAddendumNonCtid));
@@ -1465,7 +1469,6 @@ orioledb_amgettuple(IndexScanDesc scan, ScanDirection dir)
 {
 	bool		res;
 	OScanState *o_scan = (OScanState *) scan;
-	BTScanOpaque so = (BTScanOpaque) scan->opaque;
 	OTableDescr *descr;
 	OTuple		tuple;
 	bool		scan_primary;
@@ -1476,33 +1479,14 @@ orioledb_amgettuple(IndexScanDesc scan, ScanDirection dir)
 	o_scan->scanDir = dir;
 
 	if (scan->xs_snapshot->snapshot_type == SNAPSHOT_DIRTY)
-		o_scan->o_snapshot = o_in_progress_snapshot;
+		o_scan->oSnapshot = o_in_progress_snapshot;
 	else if (scan->xs_snapshot->snapshot_type == SNAPSHOT_NON_VACUUMABLE)
-		o_scan->o_snapshot = o_non_deleted_snapshot;
+		o_scan->oSnapshot = o_non_deleted_snapshot;
 	else
-		O_LOAD_SNAPSHOT(&o_scan->o_snapshot, scan->xs_snapshot);
+		O_LOAD_SNAPSHOT(&o_scan->oSnapshot, scan->xs_snapshot);
 
 	/* btree indexes are never lossy */
 	scan->xs_recheck = false;
-
-	/*
-	 * If we have any array keys, initialize them during first call for a
-	 * scan.  We can't do this in btrescan because we don't know the scan
-	 * direction at that time.
-	 */
-	if (so->numArrayKeys && !o_scan->curKeyRangeIsLoaded)
-	{
-		/* punt if we have any unsatisfiable array keys */
-		if (so->numArrayKeys < 0)
-			return false;
-
-		_bt_start_array_keys(scan, dir);
-	}
-	if (!o_scan->curKeyRangeIsLoaded)
-	{
-		_bt_preprocess_keys(scan);
-		o_scan->curKeyRange.empty = true;
-	}
 
 	descr = relation_get_descr(scan->heapRelation);
 	scan_primary = o_scan->ixNum == PrimaryIndexNumber || !scan->xs_want_itup;

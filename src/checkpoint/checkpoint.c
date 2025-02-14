@@ -10,6 +10,7 @@
  *
  *-------------------------------------------------------------------------
  */
+#include "c.h"
 #include "postgres.h"
 
 #include <sys/file.h>
@@ -116,13 +117,16 @@ typedef struct
 {
 	ORelOids	oids;
 	OIndexType	type;
+	bool		freeExtents;
+	bool		cleanupMap;
+	bool		punchHoles;
+	uint32		lastMapChkpNum;
 	uint32		chkpNum;
 } IndexIdItem;
 
 typedef struct
 {
-	List	   *cleanupMap;
-	List	   *freeExtents;
+	List	   *postProcessList;
 	int			flags;
 } CheckpointTablesArg;
 
@@ -295,6 +299,7 @@ checkpoint_shmem_init(Pointer ptr, bool found)
 		checkpoint_state->oXidQueueFlushTrancheId = LWLockNewTrancheId();
 		checkpoint_state->copyBlknoTrancheId = LWLockNewTrancheId();
 		checkpoint_state->oMetaTrancheId = LWLockNewTrancheId();
+		checkpoint_state->punchHolesTrancheId = LWLockNewTrancheId();
 		LWLockInitialize(&checkpoint_state->oTablesMetaLock,
 						 checkpoint_state->oTablesMetaTrancheId);
 		LWLockInitialize(&checkpoint_state->oSysTreesLock,
@@ -367,6 +372,8 @@ checkpoint_shmem_init(Pointer ptr, bool found)
 						  "CopyBlknoTranche");
 	LWLockRegisterTranche(checkpoint_state->oMetaTrancheId,
 						  "orioledb_meta");
+	LWLockRegisterTranche(checkpoint_state->punchHolesTrancheId,
+						  "PunchHolesTranche");
 	LWLockRegisterTranche(checkpoint_state->oXidQueueTrancheId,
 						  "OXidQueueTranche");
 	LWLockRegisterTranche(checkpoint_state->oXidQueueFlushTrancheId,
@@ -513,50 +520,46 @@ free_writeback(CheckpointWriteBack *writeback)
 }
 
 static inline List *
-add_index_id_item(List *list, BTreeDescr *desc, uint32 chkpNum)
+add_index_id_item(List *list, BTreeDescr *desc)
 {
 	IndexIdItem *item;
 	MemoryContext old_context;
 
-	old_context = MemoryContextSwitchTo(TopMemoryContext);
+	Assert(!orioledb_s3_mode);
+	Assert(desc->storageType == BTreeStoragePersistence ||
+		   desc->storageType == BTreeStorageUnlogged);
+	old_context = MemoryContextSwitchTo(chkp_main_context);
 	item = palloc(sizeof(IndexIdItem));
 	item->oids = desc->oids;
 	item->type = desc->type;
-	list = lappend(list, item);
+	item->chkpNum = checkpoint_state->lastCheckpointNumber;
+	item->freeExtents = OCompressIsValid(desc->compress);
+	item->cleanupMap = false;
+	item->punchHoles = orioledb_use_sparse_files && !OCompressIsValid(desc->compress);
+	if (remove_old_checkpoint_files)
+	{
+		item->lastMapChkpNum = o_get_latest_chkp_num(desc->oids.datoid, desc->oids.relnode,
+													 checkpoint_state->lastCheckpointNumber,
+													 NULL);
+		if (!OCompressIsValid(desc->compress) &&
+			desc->freeBuf.tag.type == 'm' &&
+			desc->freeBuf.tag.num == item->lastMapChkpNum)
+		{
+			item->cleanupMap = false;
+		}
+		else
+		{
+			item->cleanupMap = true;
+		}
+	}
+
+	if (item->cleanupMap || item->freeExtents || item->punchHoles)
+		list = lappend(list, item);
+	else
+		pfree(item);
 	MemoryContextSwitchTo(old_context);
 
 	return list;
-}
-
-static inline List *
-add_free_extents_item(List *free, BTreeDescr *desc)
-{
-	return add_index_id_item(free, desc,
-							 checkpoint_state->lastCheckpointNumber);
-}
-
-static inline List *
-add_map_cleanup_item(List *cleanup, BTreeDescr *desc)
-{
-	uint32		chkpNum;
-
-	if (!remove_old_checkpoint_files)
-		return cleanup;
-
-	chkpNum = o_get_latest_chkp_num(desc->oids.datoid, desc->oids.relnode,
-									checkpoint_state->lastCheckpointNumber,
-									NULL);
-
-	if (!OCompressIsValid(desc->compress) &&
-		desc->freeBuf.tag.type == 'm' &&
-		desc->freeBuf.tag.num == chkpNum)
-	{
-		return cleanup;
-	}
-	else
-	{
-		return add_index_id_item(cleanup, desc, chkpNum);
-	}
 }
 
 /*
@@ -607,7 +610,7 @@ open_xids_file(void)
 		xidFile = PathNameOpenFile(xidFilename, O_WRONLY | O_CREAT | PG_BINARY);
 		if (xidFile < 0)
 			ereport(FATAL, (errcode_for_file_access(),
-							errmsg("could not open xid file %s", xidFilename)));
+							errmsg("could not open xid file %s: %m", xidFilename)));
 		xidFileCheckpointnum = checkpointnum;
 	}
 }
@@ -640,7 +643,7 @@ flush_xids_queue(void)
 					   sizeof(uint32) + sizeof(XidFileRec) * startPos,
 					   WAIT_EVENT_SLRU_WRITE) != sizeof(XidFileRec) * (endPos - startPos))
 			ereport(FATAL, (errcode_for_file_access(),
-							errmsg("could not write xid record to file %s", xidFilename)));
+							errmsg("could not write xid record to file %s: %m", xidFilename)));
 	}
 	else
 	{
@@ -657,7 +660,7 @@ flush_xids_queue(void)
 					   sizeof(uint32) + sizeof(XidFileRec) * startPos,
 					   WAIT_EVENT_SLRU_WRITE) != sizeof(XidFileRec) * len1)
 			ereport(FATAL, (errcode_for_file_access(),
-							errmsg("could not write xid record to file %s", xidFilename)));
+							errmsg("could not write xid record to file %s: %m", xidFilename)));
 
 		if (OFileWrite(xidFile,
 					   (Pointer) &checkpoint_state->xidRecQueue[0],
@@ -665,7 +668,7 @@ flush_xids_queue(void)
 					   sizeof(uint32) + sizeof(XidFileRec) * (startPos + len1),
 					   WAIT_EVENT_SLRU_WRITE) != sizeof(XidFileRec) * len2)
 			ereport(FATAL, (errcode_for_file_access(),
-							errmsg("could not write xid record to file %s", xidFilename)));
+							errmsg("could not write xid record to file %s: %m", xidFilename)));
 	}
 
 	for (location = startPos; location < endPos; location++)
@@ -755,11 +758,11 @@ close_xids_file(void)
 	if (OFileWrite(xidFile, (Pointer) &count,
 				   sizeof(count), 0, WAIT_EVENT_SLRU_WRITE) != sizeof(count))
 		ereport(FATAL, (errcode_for_file_access(),
-						errmsg("could not write xid record to file %s", xidFilename)));
+						errmsg("could not write xid record to file %s: %m", xidFilename)));
 
 	if (FileSync(xidFile, WAIT_EVENT_SLRU_SYNC) < 0)
 		ereport(FATAL, (errcode_for_file_access(),
-						errmsg("could not sync xid file %s", xidFilename)));
+						errmsg("could not sync xid file %s: %m", xidFilename)));
 
 	FileClose(xidFile);
 	pfree(xidFilename);
@@ -798,6 +801,7 @@ finish_write_xids(uint32 chkpnum)
 				k;
 
 	memset(&xidRec, 0, sizeof(xidRec));
+	ASAN_UNPOISON_MEMORY_REGION(&xidRec, sizeof(xidRec));
 
 	for (i = 0; i < max_procs; i++)
 	{
@@ -874,8 +878,8 @@ checkpoint_sys_trees(int flags, uint32 cur_chkp_num,
 			{
 				sort_checkpoint_map_file(desc, cur_chkp_num % 2);
 				sort_checkpoint_tmp_file(desc, cur_chkp_num % 2);
-				chkp_tbl_arg->cleanupMap = add_map_cleanup_item(chkp_tbl_arg->cleanupMap,
-																desc);
+				chkp_tbl_arg->postProcessList = add_index_id_item(chkp_tbl_arg->postProcessList,
+																  desc);
 			}
 		}
 		else
@@ -907,8 +911,8 @@ checkpoint_chkp_nums(int flags, uint32 cur_chkp_num,
 	{
 		sort_checkpoint_map_file(desc, cur_chkp_num % 2);
 		sort_checkpoint_tmp_file(desc, cur_chkp_num % 2);
-		chkp_tbl_arg->cleanupMap = add_map_cleanup_item(chkp_tbl_arg->cleanupMap,
-														desc);
+		chkp_tbl_arg->postProcessList = add_index_id_item(chkp_tbl_arg->postProcessList,
+														  desc);
 	}
 }
 
@@ -1103,8 +1107,7 @@ o_perform_checkpoint(XLogRecPtr redo_pos, int flags)
 
 	memset(&control, 0, sizeof(control));
 
-	chkp_tbl_arg.cleanupMap = NULL;
-	chkp_tbl_arg.freeExtents = NULL;
+	chkp_tbl_arg.postProcessList = NIL;
 	chkp_tbl_arg.flags = flags;
 
 	checkpoint_state->dirtyPagesEstimate = get_dirty_pages_count_sum();
@@ -1125,6 +1128,9 @@ o_perform_checkpoint(XLogRecPtr redo_pos, int flags)
 	for (i = 0; i < (int) UndoLogsCount; i++)
 	{
 		UndoMeta   *undo_meta = get_undo_meta_by_type((UndoLogType) i);
+
+		if ((UndoLogType) i == UndoLogRegularPageLevel)
+			continue;
 
 		checkpoint_start_loc[i] = pg_atomic_read_u64(&undo_meta->minProcTransactionRetainLocation);
 		pg_atomic_write_u64(&my_proc_info->undoRetainLocations[i].snapshotRetainUndoLocation,
@@ -1156,8 +1162,6 @@ o_perform_checkpoint(XLogRecPtr redo_pos, int flags)
 	LWLockRelease(&checkpoint_state->oSysTreesLock);
 	LWLockRelease(&checkpoint_state->oTablesMetaLock);
 
-	MemoryContextResetOnly(chkp_main_context);
-
 	enable_stopevents = old_enable_stopevents;
 
 	LWLockAcquire(&checkpoint_state->oTablesMetaLock, LW_EXCLUSIVE);
@@ -1166,19 +1170,6 @@ o_perform_checkpoint(XLogRecPtr redo_pos, int flags)
 	LWLockRelease(&checkpoint_state->oTablesMetaLock);
 
 	checkpoint_chkp_nums(flags, cur_chkp_num, &chkp_tbl_arg);
-
-	LWLockAcquire(&checkpoint_state->oTablesMetaLock, LW_EXCLUSIVE);
-
-	chkp_inc_changecount_before(checkpoint_state);
-	checkpoint_state->lastCheckpointNumber++;
-	checkpoint_state->treeType = oIndexInvalid;
-	checkpoint_state->datoid = InvalidOid;
-	checkpoint_state->reloid = InvalidOid;
-	checkpoint_state->relnode = InvalidOid;
-	checkpoint_state->completed = false;
-	chkp_inc_changecount_after(checkpoint_state);
-
-	LWLockRelease(&checkpoint_state->oTablesMetaLock);
 
 	/*
 	 * It might happen there is no secondary indices, but we still need to set
@@ -1204,6 +1195,9 @@ o_perform_checkpoint(XLogRecPtr redo_pos, int flags)
 
 	for (i = 0; i < (int) UndoLogsCount; i++)
 	{
+		if ((UndoLogType) i == UndoLogRegularPageLevel)
+			continue;
+
 		fsync_undo_range((UndoLogType) i,
 						 checkpoint_start_loc[i],
 						 checkpoint_end_loc[i],
@@ -1230,9 +1224,84 @@ o_perform_checkpoint(XLogRecPtr redo_pos, int flags)
 					   checkpoint_xmax,
 					   WAIT_EVENT_DATA_FILE_IMMEDIATE_SYNC);
 
+	if (checkpoint_state->controlIdentifier == 0)
+	{
+		struct timeval tv;
+		uint64		controlIdentifier = 0;
+
+		gettimeofday(&tv, NULL);
+		controlIdentifier = ((uint64) tv.tv_sec) << 32;
+		controlIdentifier |= ((uint64) tv.tv_usec) << 12;
+		controlIdentifier |= getpid() & 0xFFF;
+
+		checkpoint_state->controlIdentifier = controlIdentifier;
+	}
+
+	ASAN_UNPOISON_MEMORY_REGION(&control, sizeof(control));
+
+	control.controlIdentifier = checkpoint_state->controlIdentifier;
+	control.lastCheckpointNumber = checkpoint_state->lastCheckpointNumber + 1;
+	control.lastCSN = pg_atomic_read_u64(&TRANSAM_VARIABLES->nextCommitSeqNo);
+	control.lastXid = pg_atomic_read_u64(&xid_meta->nextXid);
+	control.sysTreesStartPtr = checkpoint_state->sysTreesStartPtr;
+	control.replayStartPtr = checkpoint_state->replayStartPtr;
+	control.toastConsistentPtr = checkpoint_state->toastConsistentPtr;
+	control.mmapDataLength = pg_atomic_read_u64(&checkpoint_state->mmapDataLength);
 	for (i = 0; i < (int) UndoLogsCount; i++)
 	{
 		UndoMeta   *undo_meta = get_undo_meta_by_type((UndoLogType) i);
+		CheckpointUndoInfo *undo_info = &control.undoInfo[i];
+
+		undo_info->lastUndoLocation = pg_atomic_read_u64(&undo_meta->lastUsedLocation);
+		if ((UndoLogType) i != UndoLogRegularPageLevel)
+		{
+			undo_info->checkpointRetainStartLocation = checkpoint_start_loc[i];
+			undo_info->checkpointRetainEndLocation = checkpoint_end_loc[i];
+		}
+		else
+		{
+			undo_info->checkpointRetainStartLocation = 0;
+			undo_info->checkpointRetainEndLocation = 0;
+		}
+	}
+	control.checkpointRetainXmin = checkpoint_xmin;
+	control.checkpointRetainXmax = checkpoint_xmax;
+	control.binaryVersion = ORIOLEDB_BINARY_VERSION;
+	control.s3Mode = orioledb_s3_mode;
+
+	write_checkpoint_control(&control);
+
+	/*
+	 * Once we've written a new control file, we know that we will start
+	 * recovery from a new checkpoint.  Then we can start releasing the
+	 * resources.
+	 */
+
+	LWLockAcquire(&checkpoint_state->oTablesMetaLock, LW_EXCLUSIVE);
+
+	/*
+	 * This will let processes reuse data pages of previous checkpoint.
+	 */
+	chkp_inc_changecount_before(checkpoint_state);
+	checkpoint_state->lastCheckpointNumber++;
+	checkpoint_state->treeType = oIndexInvalid;
+	checkpoint_state->datoid = InvalidOid;
+	checkpoint_state->reloid = InvalidOid;
+	checkpoint_state->relnode = InvalidOid;
+	checkpoint_state->completed = false;
+	chkp_inc_changecount_after(checkpoint_state);
+
+	LWLockRelease(&checkpoint_state->oTablesMetaLock);
+
+	/*
+	 * Also release xidmap and undo ranges retained for previous checkpoint.
+	 */
+	for (i = 0; i < (int) UndoLogsCount; i++)
+	{
+		UndoMeta   *undo_meta = get_undo_meta_by_type((UndoLogType) i);
+
+		if ((UndoLogType) i == UndoLogRegularPageLevel)
+			continue;
 
 		SpinLockAcquire(&undo_meta->minUndoLocationsMutex);
 		pg_atomic_write_u64(&undo_meta->checkpointRetainStartLocation,
@@ -1252,99 +1321,78 @@ o_perform_checkpoint(XLogRecPtr redo_pos, int flags)
 	for (i = 0; i < (int) UndoLogsCount; i++)
 		pg_atomic_write_u64(&my_proc_info->undoRetainLocations[i].snapshotRetainUndoLocation, InvalidUndoLocation);
 
-	if (checkpoint_state->controlIdentifier == 0)
-	{
-		struct timeval tv;
-		uint64		controlIdentifier = 0;
-
-		gettimeofday(&tv, NULL);
-		controlIdentifier = ((uint64) tv.tv_sec) << 32;
-		controlIdentifier |= ((uint64) tv.tv_usec) << 12;
-		controlIdentifier |= getpid() & 0xFFF;
-
-		checkpoint_state->controlIdentifier = controlIdentifier;
-	}
-
-	control.controlIdentifier = checkpoint_state->controlIdentifier;
-	control.lastCheckpointNumber = checkpoint_state->lastCheckpointNumber;
-	control.lastCSN = pg_atomic_read_u64(&TRANSAM_VARIABLES->nextCommitSeqNo);
-	control.lastXid = pg_atomic_read_u64(&xid_meta->nextXid);
-	control.sysTreesStartPtr = checkpoint_state->sysTreesStartPtr;
-	control.replayStartPtr = checkpoint_state->replayStartPtr;
-	control.toastConsistentPtr = checkpoint_state->toastConsistentPtr;
-	control.mmapDataLength = pg_atomic_read_u64(&checkpoint_state->mmapDataLength);
-	for (i = 0; i < (int) UndoLogsCount; i++)
-	{
-		UndoMeta   *undo_meta = get_undo_meta_by_type((UndoLogType) i);
-		CheckpointUndoInfo *undo_info = &control.undoInfo[i];
-
-		undo_info->lastUndoLocation = pg_atomic_read_u64(&undo_meta->lastUsedLocation);
-		undo_info->checkpointRetainStartLocation = pg_atomic_read_u64(&undo_meta->checkpointRetainStartLocation);
-		undo_info->checkpointRetainEndLocation = pg_atomic_read_u64(&undo_meta->checkpointRetainEndLocation);
-	}
-	control.checkpointRetainXmin = pg_atomic_read_u64(&xid_meta->checkpointRetainXmin);
-	control.checkpointRetainXmax = pg_atomic_read_u64(&xid_meta->checkpointRetainXmax);
-	control.binaryVersion = ORIOLEDB_BINARY_VERSION;
-	control.s3Mode = orioledb_s3_mode;
-
-	write_checkpoint_control(&control);
+	pg_atomic_write_u64(&my_proc_info->xmin, InvalidOXid);
 
 	/*
 	 * Now we can free extents for compressed indices
 	 */
-	if (!(flags & CHECKPOINT_IS_SHUTDOWN) && chkp_tbl_arg.freeExtents != NIL)
+	if ((!(flags & CHECKPOINT_IS_SHUTDOWN) || remove_old_checkpoint_files) &&
+		chkp_tbl_arg.postProcessList != NIL)
 	{
 		IndexIdItem *item;
 		ListCell   *lc;
 		OIndexDescr *descr;
 
-		foreach(lc, chkp_tbl_arg.freeExtents)
+		foreach(lc, chkp_tbl_arg.postProcessList)
 		{
 			item = (IndexIdItem *) lfirst(lc);
 
-			descr = o_fetch_index_descr(item->oids, item->type,
-										true, NULL);
-			if (descr == NULL)
+			if (item->freeExtents)
 			{
-				/* table might be deleted */
-				continue;
+				descr = o_fetch_index_descr(item->oids, item->type,
+											true, NULL);
+				if (descr == NULL)
+				{
+					/* table might be deleted */
+					continue;
+				}
+
+				add_free_extents_from_tmp(&descr->desc,
+										  remove_old_checkpoint_files);
+				o_tables_rel_unlock_extended(&item->oids, AccessShareLock, true);
 			}
 
-			add_free_extents_from_tmp(&descr->desc,
-									  remove_old_checkpoint_files);
-			o_tables_rel_unlock_extended(&item->oids, AccessShareLock, true);
+			if (item->cleanupMap)
+			{
+				SeqBufTag	cleanup_tag;
+
+				cleanup_tag.type = 'm';
+				cleanup_tag.num = item->lastMapChkpNum;
+				cleanup_tag.datoid = item->oids.datoid;
+				cleanup_tag.relnode = item->oids.relnode;
+				seq_buf_remove_file(&cleanup_tag);
+			}
+
+			if (item->punchHoles)
+			{
+				BTreeDescr *desc;
+
+				if (IS_SYS_TREE_OIDS(item->oids))
+				{
+					desc = get_sys_tree(item->oids.reloid);
+				}
+				else
+				{
+					OIndexDescr *id;
+
+					id = o_fetch_index_descr(item->oids, item->type,
+											 true, NULL);
+					desc = &id->desc;
+				}
+
+				try_to_punch_holes(desc);
+
+				if (!IS_SYS_TREE_OIDS(item->oids))
+					o_tables_rel_unlock_extended(&item->oids, AccessShareLock, true);
+			}
 		}
-		list_free_deep(chkp_tbl_arg.freeExtents);
 	}
+	list_free_deep(chkp_tbl_arg.postProcessList);
 
-	/*
-	 * Remove old files if needed
-	 */
 	if (remove_old_checkpoint_files)
-	{
-		IndexIdItem *item;
-		SeqBufTag	cleanup_tag;
-		ListCell   *lc;
-
 		unlink_xids_file(prev_chkp_num);
 
-		cleanup_tag.type = 'm';
-		cleanup_tag.num = prev_chkp_num;
-
-		foreach(lc, chkp_tbl_arg.cleanupMap)
-		{
-			item = (IndexIdItem *) lfirst(lc);
-			cleanup_tag.datoid = item->oids.datoid;
-			cleanup_tag.relnode = item->oids.relnode;
-			seq_buf_remove_file(&cleanup_tag);
-		}
-
-		list_free_deep(chkp_tbl_arg.cleanupMap);
-	}
-
 	CheckPointProgress = o_checkpoint_completion_ratio;
-
-	pg_atomic_write_u64(&my_proc_info->xmin, InvalidOXid);
 
 	o_unset_syscache_hooks();
 
@@ -1394,7 +1442,7 @@ checkpoint_init_new_seq_bufs(BTreeDescr *descr, int chkpNum)
 	if (!success)
 		ereport(FATAL,
 				(errcode_for_file_access(),
-				 errmsg("could not init a new sequence buffer file %s",
+				 errmsg("could not init a new sequence buffer file %s: %m",
 						get_seq_buf_filename(&next_tmp_tag))));
 
 	if (descr->storageType != BTreeStoragePersistence)
@@ -1414,7 +1462,7 @@ checkpoint_init_new_seq_bufs(BTreeDescr *descr, int chkpNum)
 	if (!success)
 		ereport(FATAL,
 				(errcode_for_file_access(),
-				 errmsg("could not create a new sequence buffer file %s",
+				 errmsg("could not create a new sequence buffer file %s: %m",
 						get_seq_buf_filename(&next_chkp_tag))));
 }
 
@@ -1600,7 +1648,7 @@ append_file_contents(File target, char *source_filename, uint64 offset)
 	source = PathNameOpenFile(source_filename, O_RDONLY | PG_BINARY);
 	if (source < 0)
 		ereport(FATAL, (errcode_for_file_access(),
-						errmsg("could not open file for finalize checkpoint map: %s",
+						errmsg("could not open file for finalize checkpoint map %s: %m",
 							   source_filename)));
 
 	do
@@ -1609,7 +1657,7 @@ append_file_contents(File target, char *source_filename, uint64 offset)
 		if (OFileWrite(target, buf, block_len, target_offset, WAIT_EVENT_DATA_FILE_WRITE) != block_len)
 			ereport(FATAL,
 					(errcode_for_file_access(),
-					 errmsg("could not copy data for finalize checkpoint map: %s", source_filename)));
+					 errmsg("could not copy data for finalize checkpoint map %s: %m", source_filename)));
 		target_offset += block_len;
 		offset += block_len;
 		len += block_len;
@@ -1628,7 +1676,7 @@ finalize_chkp_map(File chkp_file, uint64 len, char *input_filename,
 
 	if (FileSize(chkp_file) != len)
 		ereport(FATAL, (errcode_for_file_access(),
-						errmsg("could not move to offset %lu for making finalize checkpoint map: %s",
+						errmsg("could not move to offset %lu for making finalize checkpoint map %s: %m",
 							   len, FilePathName(chkp_file))));
 
 	if (input_filename != NULL)
@@ -1745,7 +1793,7 @@ sort_checkpoint_map_file(BTreeDescr *descr, int cur_chkp_index)
 	if (file < 0)
 	{
 		ereport(FATAL, (errcode_for_file_access(),
-						errmsg("Could not open checkpoint map file: %s",
+						errmsg("Could not open checkpoint map file %s: %m",
 							   filename)));
 	}
 
@@ -1755,7 +1803,7 @@ sort_checkpoint_map_file(BTreeDescr *descr, int cur_chkp_index)
 	if (ferror)
 	{
 		ereport(FATAL, (errcode_for_file_access(),
-						errmsg("Could not read data from checkpoint map file: %s",
+						errmsg("Could not read data from checkpoint map file %s: %m",
 							   filename)));
 	}
 
@@ -1777,7 +1825,7 @@ sort_checkpoint_map_file(BTreeDescr *descr, int cur_chkp_index)
 		if (read_size != free_blocks_size)
 		{
 			ereport(FATAL, (errcode_for_file_access(),
-							errmsg("Could not read data from checkpoint map file: %s",
+							errmsg("Could not read data from checkpoint map file %s: %m",
 								   filename)));
 		}
 	}
@@ -1794,7 +1842,7 @@ sort_checkpoint_map_file(BTreeDescr *descr, int cur_chkp_index)
 		FileSync(file, WAIT_EVENT_SLRU_SYNC) != 0)
 	{
 		ereport(FATAL, (errcode_for_file_access(),
-						errmsg("Could not write sorted data to checkpoint map file: %s",
+						errmsg("Could not write sorted data to checkpoint map file %s: %m",
 							   filename)));
 	}
 	FileClose(file);
@@ -1835,7 +1883,7 @@ sort_checkpoint_tmp_file(BTreeDescr *descr, int cur_chkp_index)
 		if (read_size != free_blocks_size)
 		{
 			ereport(FATAL, (errcode_for_file_access(),
-							errmsg("Could not read data from checkpoint tmp file: %s %d %lu",
+							errmsg("Could not read data from checkpoint tmp file: %s %d %lu: %m",
 								   filename, read_size, free_blocks_size)));
 		}
 	}
@@ -1858,7 +1906,7 @@ sort_checkpoint_tmp_file(BTreeDescr *descr, int cur_chkp_index)
 		FileSync(file, WAIT_EVENT_SLRU_SYNC) != 0)
 	{
 		ereport(FATAL, (errcode_for_file_access(),
-						errmsg("Could not write sorted data to checkpoint tmp file: %s",
+						errmsg("Could not write sorted data to checkpoint tmp file %s: %m",
 							   filename)));
 	}
 
@@ -1920,7 +1968,7 @@ free_extent_for_checkpoint(BTreeDescr *desc, FileExtent *extent, uint32 chkp_num
 		if (!success)
 		{
 			ereport(ERROR, (errcode_for_file_access(),
-							errmsg("could not write offset %lu to file %s",
+							errmsg("could not write offset %lu to file %s: %m",
 								   (unsigned long) extent->off,
 								   get_seq_buf_filename(&bufs[i]->shared->tag))));
 		}
@@ -2459,7 +2507,7 @@ checkpoint_ix(int flags, BTreeDescr *descr)
 	{
 		ereport(FATAL,
 				(errcode_for_file_access(),
-				 errmsg("could not open checkpoint file %s", filename)));
+				 errmsg("could not open checkpoint file %s: %m", filename)));
 	}
 
 	if (is_compressed && free_extents->size != 0 && !orioledb_s3_mode)
@@ -2489,7 +2537,7 @@ checkpoint_ix(int flags, BTreeDescr *descr)
 						  WAIT_EVENT_DATA_FILE_READ) != map_extents_bytes)
 			{
 				ereport(FATAL, (errcode_for_file_access(),
-								errmsg("could not to read extents from file %s",
+								errmsg("could not to read extents from file %s: %m",
 									   filename)));
 			}
 
@@ -2502,7 +2550,7 @@ checkpoint_ix(int flags, BTreeDescr *descr)
 							 WAIT_EVENT_DATA_FILE_TRUNCATE) < 0)
 			{
 				ereport(FATAL, (errcode_for_file_access(),
-								errmsg("could not to truncate file %s",
+								errmsg("could not to truncate file %s: %m",
 									   filename)));
 			}
 		}
@@ -2517,7 +2565,7 @@ checkpoint_ix(int flags, BTreeDescr *descr)
 						   write_bytes, write_offset, WAIT_EVENT_SLRU_WRITE) != write_bytes)
 			{
 				ereport(FATAL, (errcode_for_file_access(),
-								errmsg("could not to write extents to file %s",
+								errmsg("could not to write extents to file %s: %m",
 									   filename)));
 			}
 			header.numFreeBlocks = free_extents->size;
@@ -2564,7 +2612,7 @@ checkpoint_ix(int flags, BTreeDescr *descr)
 								   WAIT_EVENT_SLRU_WRITE) != write_buf_len)
 					{
 						ereport(FATAL, (errcode_for_file_access(),
-										errmsg("could not to write extents to file %s",
+										errmsg("could not to write extents to file %s: %m",
 											   filename)));
 					}
 					write_offset += write_buf_len;
@@ -2582,7 +2630,7 @@ checkpoint_ix(int flags, BTreeDescr *descr)
 							   WAIT_EVENT_SLRU_WRITE) != write_buf_len)
 				{
 					ereport(FATAL, (errcode_for_file_access(),
-									errmsg("could not to write extents to file %s",
+									errmsg("could not to write extents to file %s: %m",
 										   filename)));
 				}
 			}
@@ -2621,7 +2669,7 @@ checkpoint_ix(int flags, BTreeDescr *descr)
 		FileSync(file, WAIT_EVENT_SLRU_SYNC) != 0)
 	{
 		ereport(FATAL, (errcode_for_file_access(),
-						errmsg("could not write checkpoint header to file %s", filename)));
+						errmsg("could not write checkpoint header to file %s: %m", filename)));
 	}
 
 	FileClose(file);
@@ -2894,6 +2942,38 @@ checkpoint_lock_page(BTreeDescr *descr, CheckpointState *state,
 
 }
 
+static void
+checkpoint_reserve_undo(UndoLogType undoType, bool release)
+{
+	UndoLogType pageUndoType = GET_PAGE_LEVEL_UNDO_TYPE(undoType);
+
+	if (undoType == UndoLogNone)
+		return;
+
+	if (undoType == pageUndoType)
+	{
+		if (release)
+		{
+			release_undo_size(undoType);
+			free_retained_undo_location(undoType);
+		}
+		reserve_undo_size(undoType, 2 * O_MERGE_UNDO_IMAGE_SIZE);
+	}
+	else
+	{
+
+		if (release)
+		{
+			release_undo_size(undoType);
+			free_retained_undo_location(undoType);
+			release_undo_size(pageUndoType);
+			free_retained_undo_location(pageUndoType);
+		}
+		reserve_undo_size(pageUndoType, 2 * O_MERGE_UNDO_IMAGE_SIZE);
+		reserve_undo_size(undoType, 2 * O_UPDATE_MAX_UNDO_SIZE);
+	}
+}
+
 static bool
 checkpoint_try_merge_page(BTreeDescr *descr, CheckpointState *state,
 						  OInMemoryBlkno blkno, int level)
@@ -2966,12 +3046,7 @@ checkpoint_try_merge_page(BTreeDescr *descr, CheckpointState *state,
 	if (btree_try_merge_pages(descr, parentBlkno, NULL, &mergeParent,
 							  blkno, loc, rightBlkno, true))
 	{
-		if (descr->undoType != UndoLogNone)
-		{
-			release_undo_size(descr->undoType);
-			free_retained_undo_location(descr->undoType);
-			reserve_undo_size(descr->undoType, 2 * O_MERGE_UNDO_IMAGE_SIZE);
-		}
+		checkpoint_reserve_undo(descr->undoType, true);
 		return true;
 	}
 	else
@@ -2991,8 +3066,7 @@ checkpoint_fix_split_and_lock_page(BTreeDescr *descr, CheckpointState *state,
 {
 	OInMemoryBlkno old_blkno;
 
-	if (descr->undoType != UndoLogNone)
-		reserve_undo_size(descr->undoType, 2 * O_MERGE_UNDO_IMAGE_SIZE);
+	checkpoint_reserve_undo(descr->undoType, false);
 
 	while (true)
 	{
@@ -3009,7 +3083,7 @@ checkpoint_fix_split_and_lock_page(BTreeDescr *descr, CheckpointState *state,
 		if (o_btree_split_is_incomplete(*blkno, &relocked))
 		{
 			o_btree_split_fix_and_unlock(descr, *blkno);
-			reserve_undo_size(descr->undoType, 2 * O_MERGE_UNDO_IMAGE_SIZE);
+			checkpoint_reserve_undo(descr->undoType, false);
 		}
 		else if (!(level > 0 && *blkno == state->stack[level].hikeyBlkno) &&
 				 is_page_too_sparse(descr, O_GET_IN_MEMORY_PAGE(*blkno)))
@@ -3030,8 +3104,15 @@ checkpoint_fix_split_and_lock_page(BTreeDescr *descr, CheckpointState *state,
 
 	if (descr->undoType != UndoLogNone)
 	{
+		UndoLogType pageUndoType = GET_PAGE_LEVEL_UNDO_TYPE(descr->undoType);
+
 		release_undo_size(descr->undoType);
 		free_retained_undo_location(descr->undoType);
+		if (pageUndoType != descr->undoType)
+		{
+			release_undo_size(pageUndoType);
+			free_retained_undo_location(pageUndoType);
+		}
 	}
 }
 
@@ -4633,6 +4714,7 @@ checkpoint_tables_callback(OIndexType type, ORelOids treeOids,
 	uint32		chkpNum = (checkpoint_state->lastCheckpointNumber + 1);
 	int			cur_chkp_index = chkpNum % 2;
 	MemoryContext prev_context;
+	bool		loaded = false;
 
 	prev_context = MemoryContextSwitchTo(chkp_tree_context);
 
@@ -4651,7 +4733,9 @@ checkpoint_tables_callback(OIndexType type, ORelOids treeOids,
 	}
 
 	descr = o_fetch_index_descr(treeOids, type, true, NULL);
-	if (descr != NULL && o_btree_load_shmem_checkpoint(&descr->desc))
+	if (descr != NULL)
+		loaded = o_btree_load_shmem_checkpoint(&descr->desc);
+	if (loaded)
 	{
 		BTreeDescr *td = &descr->desc;
 		BTreeMetaPage *meta = BTREE_GET_META(td);
@@ -4725,9 +4809,7 @@ checkpoint_tables_callback(OIndexType type, ORelOids treeOids,
 				{
 					sort_checkpoint_map_file(td, cur_chkp_index);
 					sort_checkpoint_tmp_file(td, cur_chkp_index);
-					if (OCompressIsValid(td->compress))
-						tbl_arg->freeExtents = add_free_extents_item(tbl_arg->freeExtents, td);
-					tbl_arg->cleanupMap = add_map_cleanup_item(tbl_arg->cleanupMap, td);
+					tbl_arg->postProcessList = add_index_id_item(tbl_arg->postProcessList, td);
 				}
 				o_tables_rel_unlock_extended(&treeOids, AccessShareLock, true);
 			}
@@ -4742,6 +4824,10 @@ checkpoint_tables_callback(OIndexType type, ORelOids treeOids,
 
 
 		LWLockAcquire(&checkpoint_state->oTablesMetaLock, LW_EXCLUSIVE);
+	}
+	else if (descr != NULL)
+	{
+		o_tables_rel_unlock_extended(&treeOids, AccessShareLock, true);
 	}
 
 	MemoryContextSwitchTo(prev_context);
@@ -4816,7 +4902,7 @@ get_cur_checkpoint_number(ORelOids *oids, OIndexType type,
 bool
 can_use_checkpoint_extents(BTreeDescr *desc, uint32 chkp_num)
 {
-	BTreeMetaPage *metaPageBlkno = BTREE_GET_META(desc);;
+	BTreeMetaPage *metaPageBlkno = BTREE_GET_META(desc);
 
 	if (chkp_num > checkpoint_state->lastCheckpointNumber)
 		return false;
@@ -4827,7 +4913,7 @@ can_use_checkpoint_extents(BTreeDescr *desc, uint32 chkp_num)
 	 */
 	pg_read_barrier();
 
-	if (pg_atomic_read_u32(&metaPageBlkno->numSeqScans[chkp_num - 1]) != 0)
+	if (pg_atomic_read_u32(&metaPageBlkno->numSeqScans[(chkp_num - 1) % NUM_SEQ_SCANS_ARRAY_SIZE]) != 0)
 		return false;
 	return true;
 }
@@ -5045,7 +5131,7 @@ evictable_tree_init_meta(BTreeDescr *desc, EvictedTreeData **evicted_data,
 			if (ferror)
 			{
 				ereport(FATAL, (errcode_for_file_access(),
-								errmsg("could not to read header of map file %s",
+								errmsg("could not to read header of map file %s: %m",
 									   prev_chkp_fname)));
 			}
 			FileClose(prev_chkp_file);
@@ -5070,6 +5156,7 @@ evictable_tree_init_meta(BTreeDescr *desc, EvictedTreeData **evicted_data,
 		meta_page->dirtyFlag2 = (*evicted_data)->dirtyFlag2;
 		meta_page->partsInfo[0].writeMaxLocation = (*evicted_data)->maxLocation[0];
 		meta_page->partsInfo[1].writeMaxLocation = (*evicted_data)->maxLocation[1];
+		meta_page->punchHolesChkpNum = (*evicted_data)->punchHolesChkpNum;
 	}
 
 	VALGRIND_CHECK_MEM_IS_DEFINED(meta_page, ORIOLEDB_BLCKSZ);
@@ -5090,7 +5177,7 @@ evictable_tree_init_meta(BTreeDescr *desc, EvictedTreeData **evicted_data,
 		{
 			unlock_page(desc->rootInfo.rootPageBlkno);
 			ereport(ERROR, (errcode_for_file_access(),
-							errmsg("could not read rootPageBlkno page from %s",
+							errmsg("could not read rootPageBlkno page from %s: %m",
 								   btree_smgr_filename(desc, chkp_num,
 													   DOWNLINK_GET_DISK_OFF(file_header.rootDownlink)))));
 		}
@@ -5205,7 +5292,7 @@ evictable_tree_init(BTreeDescr *desc, bool init_shmem, bool *was_evicted)
 						  &tmp_tag, false, init_shmem, 0, NULL))
 		{
 			ereport(FATAL, (errcode_for_file_access(),
-							errmsg("could not fill sequence buffers.")));
+							errmsg("could not fill sequence buffers: %m")));
 		}
 	}
 
@@ -5214,7 +5301,7 @@ evictable_tree_init(BTreeDescr *desc, bool init_shmem, bool *was_evicted)
 					  &tmp_tag, true, init_shmem, 0, NULL))
 	{
 		ereport(FATAL, (errcode_for_file_access(),
-						errmsg("could not fill sequence buffers.")));
+						errmsg("could not fill sequence buffers: %m")));
 	}
 
 	if (!init_seq_buf(&desc->tmpBuf[1 - chkp_index],
@@ -5222,7 +5309,7 @@ evictable_tree_init(BTreeDescr *desc, bool init_shmem, bool *was_evicted)
 					  NULL, true, false, 0, NULL))
 	{
 		ereport(FATAL, (errcode_for_file_access(),
-						errmsg("could not fill sequence buffers.")));
+						errmsg("could not fill sequence buffers: %m")));
 	}
 
 	if (init_shmem && was_evicted)
@@ -5268,7 +5355,7 @@ checkpointable_tree_init(BTreeDescr *desc, bool init_shmem, bool *was_evicted)
 											  map_file_exists))
 	{
 		ereport(FATAL, (errcode_for_file_access(),
-						errmsg("could not fill sequence buffers.")));
+						errmsg("could not fill sequence buffers: %m")));
 	}
 
 	if (init_shmem && was_evicted)

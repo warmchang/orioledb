@@ -31,10 +31,15 @@ bool
 get_checkpoint_control_data(CheckpointControl *control)
 {
 	int			controlFile;
+	Size		readBytes;
 
 	controlFile = BasicOpenFile(CONTROL_FILENAME, O_RDONLY | PG_BINARY);
 	if (controlFile < 0)
 	{
+		/*
+		 * If we couldn't find the control file the we consider this case as
+		 * if there wasn't any checkpoint before.
+		 */
 		if (errno == ENOENT)
 			return false;
 
@@ -44,11 +49,19 @@ get_checkpoint_control_data(CheckpointControl *control)
 						CONTROL_FILENAME)));
 	}
 
-	if (read(controlFile, (Pointer) control,
-			 sizeof(CheckpointControl)) != sizeof(CheckpointControl))
+	readBytes = read(controlFile, (Pointer) control, sizeof(CheckpointControl));
+
+	/*
+	 * Handle special case when the control file is empty.  We consider this
+	 * case as if there wasn't created the control file and checkpoint never
+	 * finished successfully.
+	 */
+	if (readBytes == 0)
+		return false;
+	else if (readBytes != sizeof(CheckpointControl))
 		ereport(ERROR,
 				(errcode_for_file_access(),
-				 errmsg("could not read data from control file \"%s\"",
+				 errmsg("could not read data from control file \"%s\": %m",
 						CONTROL_FILENAME)));
 
 	close(controlFile);
@@ -111,13 +124,13 @@ write_checkpoint_control(CheckpointControl *control)
 	controlFile = PathNameOpenFile(CONTROL_FILENAME, O_RDWR | O_CREAT | PG_BINARY);
 	if (controlFile < 0)
 		ereport(FATAL, (errcode_for_file_access(),
-						errmsg("could not open checkpoint control file %s", CONTROL_FILENAME)));
+						errmsg("could not open checkpoint control file %s: %m", CONTROL_FILENAME)));
 
 	if (OFileWrite(controlFile, buffer, CHECKPOINT_CONTROL_FILE_SIZE, 0,
 				   WAIT_EVENT_SLRU_WRITE) != CHECKPOINT_CONTROL_FILE_SIZE ||
 		FileSync(controlFile, WAIT_EVENT_SLRU_SYNC) != 0)
 		ereport(FATAL, (errcode_for_file_access(),
-						errmsg("could not write checkpoint control to file %s", CONTROL_FILENAME)));
+						errmsg("could not write checkpoint control to file %s: %m", CONTROL_FILENAME)));
 
 	FileClose(controlFile);
 }

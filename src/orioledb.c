@@ -92,7 +92,6 @@ OrioleDBPageDesc *page_descs = NULL;
 /* Custom GUC variables */
 int			main_buffers_guc;
 static int	undo_buffers_guc;
-static int	undo_system_buffers_guc;
 static int	xid_buffers_guc;
 int			max_procs;
 Size		orioledb_buffers_size;
@@ -100,8 +99,8 @@ Size		orioledb_buffers_count;
 Size		page_descs_size;
 Size		undo_circular_buffer_size;
 uint32		undo_buffers_count;
-Size		undo_system_circular_buffer_size;
-uint32		undo_system_buffers_count;
+double		regular_block_undo_circular_buffer_fraction;
+double		system_undo_circular_buffer_fraction;
 Size		xid_circular_buffer_size;
 uint32		xid_buffers_count;
 bool		remove_old_checkpoint_files = true;
@@ -109,6 +108,7 @@ bool		skip_unmodified_trees = true;
 bool		debug_disable_bgwriter = false;
 bool		use_mmap = false;
 bool		use_device = false;
+bool		orioledb_use_sparse_files = false;
 char	   *device_filename = NULL;
 Pointer		mmap_data = NULL;
 int			device_fd;
@@ -321,8 +321,8 @@ _PG_init(void)
 							"Size of orioledb engine undo log buffers.",
 							NULL,
 							&undo_buffers_guc,
-							Max(128, 8 * max_procs),
-							8 * max_procs,
+							Max(128, 16 * max_procs),
+							16 * max_procs,
 							INT_MAX,
 							PGC_POSTMASTER,
 							GUC_UNIT_BLOCKS,
@@ -330,18 +330,31 @@ _PG_init(void)
 							NULL,
 							NULL);
 
-	DefineCustomIntVariable("orioledb.undo_system_buffers",
-							"Size of undo log buffers for orioledb system trees.",
-							NULL,
-							&undo_system_buffers_guc,
-							Max(128, 8 * max_procs),
-							8 * max_procs,
-							INT_MAX,
-							PGC_POSTMASTER,
-							GUC_UNIT_BLOCKS,
-							NULL,
-							NULL,
-							NULL);
+	DefineCustomRealVariable("orioledb.regular_block_undo_circular_buffer_fraction",
+							 "Fraction of cirucular buffer for block-level undo of regular tables.",
+							 NULL,
+							 &regular_block_undo_circular_buffer_fraction,
+							 0.45,
+							 0.05,
+							 0.95,
+							 PGC_POSTMASTER,
+							 0,
+							 NULL,
+							 NULL,
+							 NULL);
+
+	DefineCustomRealVariable("orioledb.system_undo_circular_buffer_fraction",
+							 "Fraction of cirucular buffer for undo of system trees.",
+							 NULL,
+							 &system_undo_circular_buffer_fraction,
+							 0.10,
+							 0.05,
+							 0.95,
+							 PGC_POSTMASTER,
+							 0,
+							 NULL,
+							 NULL,
+							 NULL);
 
 	DefineCustomIntVariable("orioledb.xid_buffers",
 							"Size of orioledb engine xid buffers.",
@@ -615,6 +628,17 @@ _PG_init(void)
 							 NULL,
 							 NULL);
 
+	DefineCustomBoolVariable("orioledb.use_sparse_files",
+							 "Punch sparse file holes for free blocks",
+							 NULL,
+							 &orioledb_use_sparse_files,
+							 false,
+							 PGC_POSTMASTER,
+							 0,
+							 NULL,
+							 NULL,
+							 NULL);
+
 	DefineCustomBoolVariable("orioledb.s3_mode",
 							 "The OrioleDB function mode on top of S3 storage",
 							 NULL,
@@ -782,11 +806,6 @@ _PG_init(void)
 	undo_circular_buffer_size /= ORIOLEDB_BLCKSZ;
 	undo_buffers_count = (uint32) undo_circular_buffer_size;
 	undo_circular_buffer_size *= ORIOLEDB_BLCKSZ;
-
-	undo_system_circular_buffer_size = ((Size) undo_system_buffers_guc * BLCKSZ) / 2;
-	undo_system_circular_buffer_size /= ORIOLEDB_BLCKSZ;
-	undo_system_buffers_count = (uint32) undo_system_circular_buffer_size;
-	undo_system_circular_buffer_size *= ORIOLEDB_BLCKSZ;
 
 	xid_circular_buffer_size = ((Size) xid_buffers_guc * BLCKSZ) / 2;
 	xid_circular_buffer_size /= ORIOLEDB_BLCKSZ;
@@ -1509,6 +1528,8 @@ jsonb_push_key(JsonbParseState **state, char *key)
 {
 	JsonbValue	jval;
 
+	memset(&jval, 0, sizeof(jval));
+	ASAN_UNPOISON_MEMORY_REGION(&jval, sizeof(jval));
 	jval.type = jbvString;
 	jval.val.string.len = strlen(key);
 	jval.val.string.val = key;
@@ -1519,6 +1540,8 @@ void
 jsonb_push_int8_key(JsonbParseState **state, char *key, int64 value)
 {
 	JsonbValue	jval;
+
+	ASAN_UNPOISON_MEMORY_REGION(&jval, sizeof(jval));
 
 	jsonb_push_key(state, key);
 
@@ -1547,6 +1570,8 @@ jsonb_push_bool_key(JsonbParseState **state, char *key, bool value)
 
 	jsonb_push_key(state, key);
 
+	ASAN_UNPOISON_MEMORY_REGION(&jval, sizeof(jval));
+
 	jval.type = jbvBool;
 	jval.val.boolean = value;
 	(void) pushJsonbValue(state, WJB_VALUE, &jval);
@@ -1561,6 +1586,7 @@ jsonb_push_string_key(JsonbParseState **state, const char *key,
 
 	jsonb_push_key(state, (char *) key);
 
+	ASAN_UNPOISON_MEMORY_REGION(&jval, sizeof(jval));
 	jval.type = jbvString;
 	jval.val.string.len = strlen(value);
 	jval.val.string.val = (char *) value;
@@ -1584,6 +1610,7 @@ orioledb_error_cleanup_hook(void)
 	o_rewrite_cleanup();
 	if (orioledb_s3_mode)
 		s3_headers_error_cleanup();
+	in_nontransactional_truncate = false;
 }
 
 static void
